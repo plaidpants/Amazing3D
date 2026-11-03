@@ -13,14 +13,21 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         CycladicRounded
     }
 
+    [Header("VR / XR Setup (Drag 'XR Origin (XR Rig)' here!)")]
+    [Tooltip("If assigned, uses this XR Rig for VR and attaches the 2D Mac Map to the Left Controller! If left empty, spawns the Desktop WASD player.")]
+    public Transform xrRigRoot;
+    [Tooltip("Optional: Drag Left Controller Transform here. If blank, auto-searches inside xrRigRoot.")]
+    public Transform leftWristTransform;
+    public Vector3 wristMapLocalPosition = new Vector3(0.06f, 0.05f, -0.08f);
+    public Vector3 wristMapLocalEuler = new Vector3(45f, 20f, 0f);
+    public float wristMapWidthMeters = 0.18f;
+
     [Header("Architecture & Maze Settings (Press TAB in Play Mode to toggle style!)")]
     public WallArchitectureStyle architectureStyle = WallArchitectureStyle.FlatEdgedMac1Bit;
     [Range(0, 3)] public int skillLevel = 0;
     public float cellSize = 3.0f;
-    [Tooltip("Waist-high walls (0.85m) so you can easily see over the maze and checkerboard blocks")]
     public float wallHeight = 0.85f;
     public float wallThickness = 0.36f;
-    [Tooltip("Thickness of the black wireframe outlines in FlatEdgedMac1Bit mode")]
     [Range(0.01f, 0.08f)] public float blackEdgeOutlineWidth = 0.03f;
 
     [Header("Unoccupied Area Checkerboard Settings")]
@@ -33,7 +40,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     public Texture3D dither3DTexture;
     public Texture2D ditherRampTexture;
     [Range(2f, 10f)] public float dotScale = 6.2f;
-    [Range(0f, 1f)] public float dotSizeVariability = 0.0f;
+    [Range(0f, 1f)]  public float dotSizeVariability = 0.0f;
     [Range(0.5f, 5f)] public float dotContrast = 2.5f;
     [Range(0.5f, 2f)] public float lightExposure = 1.05f;
     [Range(-0.5f, 0.5f)] public float lightOffset = 0.0f;
@@ -41,6 +48,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     public bool quantizeLayers = true;
 
     [Header("2D Map Display Settings")]
+    public bool showDesktopHudMap = true;
     [Range(0.5f, 2.0f)] public float hudMapScale = 1.0f;
 
     [Header("Optional Materials")]
@@ -52,7 +60,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     public AmazingMazeData MazeData { get; private set; }
     private GameObject mazeRoot;
-    private GameObject playerObject;
+    private Transform activePlayerHeadOrBody;
+    private GameObject wristMapObject;
+    private Material wristMapMaterial;
 
     private Dictionary<(int r, int c), GameObject[]> breadcrumbMeshes = new Dictionary<(int r, int c), GameObject[]>();
 
@@ -73,6 +83,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     private WallArchitectureStyle lastBuiltStyle;
     private Vector3 lastPlayerPos;
     private float lastPlayerYaw = -999f;
+    private Type teleportAreaType;
 
     private static readonly byte[] CIRCLE_ROWS = new byte[]
     {
@@ -86,20 +97,124 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         0b00111100
     };
 
+    private object cachedTeleportProvider;
+
     void Start()
     {
+        // Locate XR Interaction Toolkit's TeleportationArea type across XRI 2.x and 3.x
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            teleportAreaType = asm.GetType("UnityEngine.XR.Interaction.Toolkit.Locomotion.Teleportation.TeleportationArea")
+                            ?? asm.GetType("UnityEngine.XR.Interaction.Toolkit.TeleportationArea");
+            if (teleportAreaType != null) break;
+        }
+
         EnsureDither3DMaterials();
         MazeData = new AmazingMazeData();
         MazeData.MakeMaze(skillLevel);
+
+        if (xrRigRoot != null)
+            CacheTeleportProviderAndHardenRays();
+
         RebuildMazeGeometryOnly();
-        SpawnSimpleDesktopPlayer();
+
+        if (xrRigRoot != null)
+            SetupVRRigAndWristMap();
+        else
+            SpawnSimpleDesktopPlayer();
+
         ConfigureCameraAndGlobalDither();
         UpdateBreadcrumbsAnd2DMap();
     }
 
+    // Finds the TeleportationProvider on the XR Rig and flattens the Teleport Ray so it cannot lob over walls!
+    void CacheTeleportProviderAndHardenRays()
+    {
+        foreach (MonoBehaviour mb in xrRigRoot.GetComponentsInChildren<MonoBehaviour>(true))
+        {
+            if (mb == null) continue;
+            Type t = mb.GetType();
+
+            if (t.Name == "TeleportationProvider")
+            {
+                cachedTeleportProvider = mb;
+            }
+            else if (t.Name == "XRRayInteractor")
+            {
+                // Make sure the Teleport Interactor ray uses a fast, flat trajectory (velocity = 22)
+                // and cannot arc over the 4.5m tall invisible wall colliders!
+                string goName = mb.gameObject.name.ToLowerInvariant();
+                if (goName.Contains("teleport"))
+                {
+                    var velProp = t.GetProperty("velocity");
+                    velProp?.SetValue(mb, 24f); // Flatter arc
+
+                    // Enable all InteractionLayers (~0) on Teleport Interactor so it always recognizes floor TeleportationAreas
+                    var maskProp = t.GetProperty("interactionLayers");
+                    if (maskProp != null)
+                    {
+                        object maskStruct = maskProp.GetValue(mb);
+                        var valField = maskStruct?.GetType().GetField("m_Bits", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                                    ?? maskStruct?.GetType().GetField("value", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                        if (valField != null)
+                        {
+                            valField.SetValue(maskStruct, unchecked((uint)~0));
+                            maskProp.SetValue(mb, maskStruct);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Properly wires up TeleportationArea at runtime (InteractionLayers = Everything, Colliders list, and TeleportationProvider)
+    void ConfigureFloorTeleportationArea(GameObject floor)
+    {
+        if (teleportAreaType == null) return;
+
+        // Deactivate floor briefly before adding TeleportationArea so OnEnable registers the collider cleanly!
+        floor.SetActive(false);
+        Component teleArea = floor.AddComponent(teleportAreaType);
+
+        // 1. Assign the floor's BoxCollider to TeleportationArea.colliders
+        var collidersProp = teleportAreaType.GetProperty("colliders");
+        if (collidersProp != null)
+        {
+            var colList = collidersProp.GetValue(teleArea) as System.Collections.IList;
+            if (colList != null)
+            {
+                colList.Clear();
+                colList.Add(floor.GetComponent<Collider>());
+            }
+        }
+
+        // 2. Assign TeleportationProvider reference if found
+        if (cachedTeleportProvider != null)
+        {
+            var providerProp = teleportAreaType.GetProperty("teleportationProvider");
+            providerProp?.SetValue(teleArea, cachedTeleportProvider);
+        }
+
+        // 3. Set InteractionLayerMask to Everything (~0) so the Teleport Interactor (Bit 31) ALWAYS matches!
+        var maskProp = teleportAreaType.GetProperty("interactionLayers");
+        if (maskProp != null)
+        {
+            object maskStruct = maskProp.GetValue(teleArea);
+            var valField = maskStruct?.GetType().GetField("m_Bits", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+                        ?? maskStruct?.GetType().GetField("value", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            if (valField != null)
+            {
+                valField.SetValue(maskStruct, unchecked((uint)~0));
+                maskProp.SetValue(teleArea, maskStruct);
+            }
+        }
+
+        floor.SetActive(true);
+    }
+
     void Update()
     {
-        // Press TAB at runtime to toggle between Flat-Edged w/ True Physical Outlines and Cycladic Rounded!
+#if ENABLE_LEGACY_INPUT_MANAGER
         if (Input.GetKeyDown(KeyCode.Tab))
         {
             architectureStyle = (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
@@ -108,19 +223,204 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             RebuildMazeGeometryOnly();
             UpdateBreadcrumbsAnd2DMap();
         }
+#endif
+        if (activePlayerHeadOrBody == null) return;
+
+        // Track player movement across grid cells (Smooth Walk, Roomscale, and Teleport!)
+        Vector3 curPos = activePlayerHeadOrBody.position;
+        var (curR, curC) = WorldToCell(curPos);
+        if (curR != MazeData.PlayerPos.r || curC != MazeData.PlayerPos.c)
+        {
+            StepPlayerTowardCell(curR, curC);
+        }
 
         // Continuously update the player's exact position and smooth rotation wedge on the 2D map
-        if (playerObject != null)
+        float curYaw = activePlayerHeadOrBody.eulerAngles.y;
+        if ((curPos - lastPlayerPos).sqrMagnitude > 0.0001f || Mathf.Abs(Mathf.DeltaAngle(curYaw, lastPlayerYaw)) > 0.25f)
         {
-            Vector3 curPos = playerObject.transform.position;
-            float curYaw = playerObject.transform.eulerAngles.y;
-            if ((curPos - lastPlayerPos).sqrMagnitude > 0.0001f || Mathf.Abs(Mathf.DeltaAngle(curYaw, lastPlayerYaw)) > 0.25f)
+            lastPlayerPos = curPos;
+            lastPlayerYaw = curYaw;
+            FlushFramebufferWithPlayerWedge();
+        }
+    }
+
+    // Validates every single step (walking or multi-cell teleport) against the maze walls!
+    // If a teleport ever tries to jump across a wall or diagonally through a corner, it clamps
+    // the player to the furthest legal cell before the wall so cheating is impossible.
+    void StepPlayerTowardCell(int targetR, int targetC)
+    {
+        bool anyMoved = false;
+        int safety = 0;
+
+        while ((MazeData.PlayerPos.r != targetR || MazeData.PlayerPos.c != targetC) && safety++ < 32)
+        {
+            int dr = Mathf.Clamp(targetR - MazeData.PlayerPos.r, -1, 1);
+            int dc = Mathf.Clamp(targetC - MazeData.PlayerPos.c, -1, 1);
+
+            bool stepped = false;
+            // Try cardinal directions toward target
+            if (dr != 0 && MazeData.TryStepToAdjacentCell(MazeData.PlayerPos.r + dr, MazeData.PlayerPos.c))
             {
-                lastPlayerPos = curPos;
-                lastPlayerYaw = curYaw;
-                FlushFramebufferWithPlayerWedge();
+                stepped = true;
+            }
+            else if (dc != 0 && MazeData.TryStepToAdjacentCell(MazeData.PlayerPos.r, MazeData.PlayerPos.c + dc))
+            {
+                stepped = true;
+            }
+
+            if (stepped)
+                anyMoved = true;
+            else
+                break; // Hit a wall! Stop advancing.
+        }
+
+        // ANTI-CHEAT SNAPBACK: If the player's rig teleported into a cell (targetR, targetC)
+        // that could NOT be reached legally through open corridors, snap the XR Rig back to PlayerPos!
+        if (MazeData.PlayerPos.r != targetR || MazeData.PlayerPos.c != targetC)
+        {
+            if (xrRigRoot != null)
+            {
+                Vector3 legalWorldPos = CellToWorldCenter(MazeData.PlayerPos.r, MazeData.PlayerPos.c, xrRigRoot.position.y);
+                Vector3 headOffset = activePlayerHeadOrBody.position - xrRigRoot.position;
+                headOffset.y = 0f;
+                xrRigRoot.position = legalWorldPos - headOffset;
             }
         }
+
+        if (anyMoved)
+            UpdateBreadcrumbsAnd2DMap();
+    }
+
+    void SetupVRRigAndWristMap()
+    {
+        // 1. Force-enable all InputActions & InputActionAssets on the XR Rig so head & hand tracking ALWAYS work!
+        ForceEnableAllXRInputActions(xrRigRoot.gameObject);
+
+        // 2. Place XR Origin at StartPos and face down the open corridor
+        xrRigRoot.position = CellToWorldCenter(MazeData.StartPos.r, MazeData.StartPos.c, 0.02f);
+
+        byte startMask = MazeData.GetSquare(MazeData.StartPos.r, MazeData.StartPos.c, MazeData.StartPos.layer);
+        float startYaw = 0f;
+        if ((startMask & (1 << AmazingMazeData.DIR_RIGHT)) != 0) startYaw = 90f;
+        else if ((startMask & (1 << AmazingMazeData.DIR_DOWN)) != 0) startYaw = 180f;
+        else if ((startMask & (1 << AmazingMazeData.DIR_LEFT)) != 0) startYaw = -90f;
+        xrRigRoot.eulerAngles = new Vector3(0f, startYaw, 0f);
+
+        // 3. Ensure Camera Offset is at standing height if Floor/Device tracking mode hasn't offset it yet
+        Transform camOffset = xrRigRoot.Find("Camera Offset");
+        if (camOffset != null && camOffset.localPosition.y < 0.1f)
+        {
+            camOffset.localPosition = new Vector3(0f, 1.36f, 0f);
+        }
+
+        // Track the VR Main Camera (HMD) for accurate head position & gaze direction on the 2D map
+        Camera vrCam = xrRigRoot.GetComponentInChildren<Camera>();
+        activePlayerHeadOrBody = (vrCam != null) ? vrCam.transform : xrRigRoot;
+
+        // 4. Find Left Controller if not manually assigned
+        if (leftWristTransform == null)
+        {
+            foreach (Transform t in xrRigRoot.GetComponentsInChildren<Transform>(true))
+            {
+                string n = t.name.ToLowerInvariant();
+                if (n.Contains("left") && (n.Contains("controller") || n.Contains("hand")))
+                {
+                    leftWristTransform = t;
+                    break;
+                }
+            }
+        }
+
+        // 5. Clean up thick white LineRenderers on controllers (which caused the white triangles!)
+        foreach (LineRenderer lr in xrRigRoot.GetComponentsInChildren<LineRenderer>(true))
+        {
+            lr.widthMultiplier = 0.004f; // Thin, subtle ray instead of a giant white wedge
+        }
+
+        // 6. Build the 3D Macintosh Wrist Map Tablet on the Left Controller
+        if (leftWristTransform != null)
+        {
+            Build3DWristMapTablet(leftWristTransform);
+        }
+        else
+        {
+            Debug.LogWarning("Could not auto-find Left Controller inside xrRigRoot. Assign 'Left Wrist Transform' in the Inspector.");
+        }
+    }
+
+    // Automatically enables XRI InputActionAssets and TrackedPoseDrivers even if InputActionManager is missing from the scene!
+    void ForceEnableAllXRInputActions(GameObject rigRoot)
+    {
+        // Enable any InputActionManager in the scene first
+        foreach (MonoBehaviour mb in FindObjectsOfType<MonoBehaviour>(true))
+        {
+            if (mb == null) continue;
+            Type t = mb.GetType();
+            if (t.Name == "InputActionManager")
+            {
+                var enableMethod = t.GetMethod("EnableInput", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                enableMethod?.Invoke(mb, null);
+            }
+
+            // Also walk every component on the XR Rig (TrackedPoseDriver, ActionBasedController, etc.)
+            // and call .Enable() on any UnityEngine.InputSystem.InputActionProperty or InputActionAsset
+            foreach (var field in t.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
+            {
+                if (field.FieldType.Name == "InputActionProperty")
+                {
+                    object propVal = field.GetValue(mb);
+                    if (propVal != null)
+                    {
+                        var actionProp = field.FieldType.GetProperty("action");
+                        object actionObj = actionProp?.GetValue(propVal);
+                        var enableAct = actionObj?.GetType().GetMethod("Enable");
+                        enableAct?.Invoke(actionObj, null);
+                    }
+                }
+                else if (field.FieldType.Name == "InputActionAsset")
+                {
+                    object assetObj = field.GetValue(mb);
+                    var enableAsset = assetObj?.GetType().GetMethod("Enable");
+                    enableAsset?.Invoke(assetObj, null);
+                }
+            }
+        }
+    }
+
+    void Build3DWristMapTablet(Transform wristParent)
+    {
+        if (wristMapObject != null) Destroy(wristMapObject);
+
+        wristMapObject = new GameObject("Mac1984_WristMap");
+        wristMapObject.transform.SetParent(wristParent, false);
+        wristMapObject.transform.localPosition = wristMapLocalPosition;
+        wristMapObject.transform.localEulerAngles = wristMapLocalEuler;
+
+        float aspect = (float)fbHeight / fbWidth;
+        float w = wristMapWidthMeters;
+        float h = w * aspect;
+
+        // Black Macintosh Window Border Frame
+        GameObject bezel = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        bezel.name = "MacWindowBezel";
+        Destroy(bezel.GetComponent<Collider>());
+        bezel.transform.SetParent(wristMapObject.transform, false);
+        bezel.transform.localPosition = new Vector3(0f, 0f, 0.003f);
+        bezel.transform.localScale = new Vector3(w + 0.01f, h + 0.01f, 0.005f);
+        bezel.GetComponent<Renderer>().sharedMaterial = blackEdgeMaterial;
+
+        // Crisp Unlit 2D Map Screen Quad
+        GameObject screen = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        screen.name = "MacMapScreen";
+        Destroy(screen.GetComponent<Collider>());
+        screen.transform.SetParent(wristMapObject.transform, false);
+        screen.transform.localPosition = Vector3.zero;
+        screen.transform.localScale = new Vector3(w, h, 1f);
+
+        Shader unlitTex = Shader.Find("Unlit/Texture");
+        if (unlitTex == null) unlitTex = Shader.Find("Standard");
+        wristMapMaterial = new Material(unlitTex) { mainTexture = mac2DMapTex };
+        screen.GetComponent<Renderer>().sharedMaterial = wristMapMaterial;
     }
 
     void OnValidate()
@@ -135,6 +435,12 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             ApplyDitherPropertiesToMaterial(whiteFloorMaterial, new Color(0.95f, 0.95f, 0.95f), lightExposure, lightOffset);
             ApplyDitherPropertiesToMaterial(blackBreadcrumbMaterial, new Color(0.08f, 0.08f, 0.08f), 0.5f, -0.2f);
             ConfigureCameraAndGlobalDither();
+
+            if (wristMapObject != null)
+            {
+                wristMapObject.transform.localPosition = wristMapLocalPosition;
+                wristMapObject.transform.localEulerAngles = wristMapLocalEuler;
+            }
 
             if (architectureStyle != lastBuiltStyle && MazeData != null)
             {
@@ -296,7 +602,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         mat.color = baseColor;
 
         Texture3D active3DTex = (useSquareMacintoshDots && generatedSquareDither3D != null) ? generatedSquareDither3D : dither3DTexture;
-        Texture2D activeRamp = (useSquareMacintoshDots && generatedSquareRamp2D != null) ? generatedSquareRamp2D : ditherRampTexture;
+        Texture2D activeRamp  = (useSquareMacintoshDots && generatedSquareRamp2D != null)   ? generatedSquareRamp2D   : ditherRampTexture;
 
         if (active3DTex != null && mat.HasProperty("_DitherTex"))
             mat.SetTexture("_DitherTex", active3DTex);
@@ -335,7 +641,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         Shader.EnableKeyword("RADIAL_COMPENSATION");
     }
 
-    // World-space UV projection so every wall segment and corner post shares seamless, continuous dither dots!
     void NormalizeMeshUVsToWorldSpacePosition(GameObject go, PrimitiveType type, Vector3 worldPos, Vector3 localScale, float uvPerMeter = 0.5f)
     {
         MeshFilter mf = go.GetComponent<MeshFilter>();
@@ -409,7 +714,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         int minC = fillUnoccupiedWithCheckerboard ? 0 : 1;
         int maxC = fillUnoccupiedWithCheckerboard ? MazeData.MaxCol + 1 : MazeData.MaxCol;
 
-        // 1. Build Floors, Breadcrumbs, and Unoccupied Checkerboard Blocks
         for (int r = minR; r <= maxR; r++)
         {
             for (int c = minC; c <= maxC; c++)
@@ -431,7 +735,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             }
         }
 
-        // 2. If using FlatEdgedMac1Bit, build unified topology-aware walls & physical-only corner outlines!
         if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
         {
             BuildSeamlessFlatWallsWithPhysicalOutlines();
@@ -442,17 +745,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         SpawnMarkerPrimitive(PrimitiveType.Cube, MazeData.EndPos.r, MazeData.EndPos.c, markerY, "GoalCube_Marker");
     }
 
-    /* ============================================================================
-     * TOPOLOGY-AWARE FLAT WALL & PHYSICAL CORNER OUTLINE BUILDER
-     * Eliminates all internal geometry seams on straight runs and L/T/X corners!
-     * ============================================================================ */
     void BuildSeamlessFlatWallsWithPhysicalOutlines()
     {
         int R = MazeData.MaxRow;
         int C = MazeData.MaxCol;
 
-        // hWall[r, c] = horizontal wall along East-West edge at grid line r (0..R), column c (1..C)
-        // vWall[r, c] = vertical wall along North-South edge at row r (1..R), grid line c (0..C)
         bool[,] hWall = new bool[R + 2, C + 2];
         bool[,] vWall = new bool[R + 2, C + 2];
 
@@ -468,9 +765,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             {
                 if (!IsCarved(r, c)) continue;
                 int mask = MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BASE) & 0x0F;
-                if ((mask & (1 << AmazingMazeData.DIR_UP)) == 0) hWall[r - 1, c] = true;
-                if ((mask & (1 << AmazingMazeData.DIR_DOWN)) == 0) hWall[r, c] = true;
-                if ((mask & (1 << AmazingMazeData.DIR_LEFT)) == 0) vWall[r, c - 1] = true;
+                if ((mask & (1 << AmazingMazeData.DIR_UP)) == 0)    hWall[r - 1, c] = true;
+                if ((mask & (1 << AmazingMazeData.DIR_DOWN)) == 0)  hWall[r, c] = true;
+                if ((mask & (1 << AmazingMazeData.DIR_LEFT)) == 0)  vWall[r, c - 1] = true;
                 if ((mask & (1 << AmazingMazeData.DIR_RIGHT)) == 0) vWall[r, c] = true;
             }
         }
@@ -482,9 +779,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         float halfWT = wt * 0.5f;
         float wh = wallHeight;
         float ew = blackEdgeOutlineWidth;
-        float spanLen = cellSize - wt; // Fits cleanly between corner posts with zero overlap!
+        float spanLen = cellSize - wt;
 
-        // Helper for vertex (vr, vc) world position (where vr in 0..R, vc in 0..C)
         Vector3 VertexWorldPos(int vr, int vc)
         {
             float vx = (vc - 0.5f) * cellSize;
@@ -492,7 +788,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             return new Vector3(vx, 0f, vz);
         }
 
-        // 1. Build Horizontal (East-West) Wall Spans between Corner Posts
         for (int r = 0; r <= R; r++)
         {
             for (int c = 1; c <= C; c++)
@@ -506,18 +801,15 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 Vector3 bodyCenter = mid + new Vector3(0f, wh * 0.5f, 0f);
                 CreateWallBoxWithWorldUVs(wallsRoot.transform, "HWallSpan", bodyCenter, scale);
 
-                // Top & Bottom long horizontal black edges along North (+Z) and South (-Z) faces
-                CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(0f, wh, halfWT), new Vector3(spanLen + ew, ew, ew));
+                CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(0f, wh,  halfWT), new Vector3(spanLen + ew, ew, ew));
                 CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(0f, wh, -halfWT), new Vector3(spanLen + ew, ew, ew));
-                CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(0f, ew * 0.5f, halfWT), new Vector3(spanLen + ew, ew, ew));
+                CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(0f, ew * 0.5f,  halfWT), new Vector3(spanLen + ew, ew, ew));
                 CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(0f, ew * 0.5f, -halfWT), new Vector3(spanLen + ew, ew, ew));
 
-                // Player-height collider
                 CreateWallColliderWorld(wallsRoot.transform, mid + new Vector3(0f, 0.9f, 0f), new Vector3(cellSize, 1.8f, wt));
             }
         }
 
-        // 2. Build Vertical (North-South) Wall Spans between Corner Posts
         for (int r = 1; r <= R; r++)
         {
             for (int c = 0; c <= C; c++)
@@ -531,25 +823,23 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 Vector3 bodyCenter = mid + new Vector3(0f, wh * 0.5f, 0f);
                 CreateWallBoxWithWorldUVs(wallsRoot.transform, "VWallSpan", bodyCenter, scale);
 
-                // Top & Bottom long horizontal black edges along East (+X) and West (-X) faces
-                CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(halfWT, wh, 0f), new Vector3(ew, ew, spanLen + ew));
+                CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3( halfWT, wh, 0f), new Vector3(ew, ew, spanLen + ew));
                 CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(-halfWT, wh, 0f), new Vector3(ew, ew, spanLen + ew));
-                CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, spanLen + ew));
+                CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3( halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, spanLen + ew));
                 CreateBlackEdgeBarWorld(wallsRoot.transform, mid + new Vector3(-halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, spanLen + ew));
 
                 CreateWallColliderWorld(wallsRoot.transform, mid + new Vector3(0f, 0.9f, 0f), new Vector3(wt, 1.8f, cellSize));
             }
         }
 
-        // 3. Build Corner Posts & ONLY Physical Corner Outlines at Grid Vertices (vr in 0..R, vc in 0..C)
         for (int vr = 0; vr <= R; vr++)
         {
             for (int vc = 0; vc <= C; vc++)
             {
                 bool hasN = (vr >= 1) && vWall[vr, vc];
-                bool hasS = (vr < R) && vWall[vr + 1, vc];
+                bool hasS = (vr < R)  && vWall[vr + 1, vc];
                 bool hasW = (vc >= 1) && hWall[vr, vc];
-                bool hasE = (vc < C) && hWall[vr, vc + 1];
+                bool hasE = (vc < C)  && hWall[vr, vc + 1];
 
                 if (!hasN && !hasS && !hasW && !hasE) continue;
 
@@ -557,8 +847,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 Vector3 postScale = new Vector3(wt, wh, wt);
                 CreateWallBoxWithWorldUVs(wallsRoot.transform, $"CornerPost_{vr}_{vc}", vPos + new Vector3(0f, wh * 0.5f, 0f), postScale);
 
-                // A. Exposed Outer Faces (where NO wall connects in that cardinal direction):
-                //    Draw the top & bottom horizontal edge along that exposed side of the post!
                 if (!hasN)
                 {
                     CreateBlackEdgeBarWorld(wallsRoot.transform, vPos + new Vector3(0f, wh, halfWT), new Vector3(wt + ew, ew, ew));
@@ -580,17 +868,13 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                     CreateBlackEdgeBarWorld(wallsRoot.transform, vPos + new Vector3(-halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, wt + ew));
                 }
 
-                // B. Vertical Corner Outlines on the 4 Quadrants of the Post (NE, NW, SE, SW):
-                //    A physical vertical corner exists at a quadrant ONLY when the two adjacent directions
-                //    are BOTH connected (inner concave 90° corner) OR BOTH disconnected (outer convex 90° corner)!
-                //    If one is connected and the other is not, the wall continues straight past that face—so NO vertical line!
-                if (hasN == hasE) // NE corner (+X, +Z)
-                    CreateBlackEdgeBarWorld(wallsRoot.transform, vPos + new Vector3(halfWT, wh * 0.5f, halfWT), new Vector3(ew, wh + ew, ew));
-                if (hasN == hasW) // NW corner (-X, +Z)
-                    CreateBlackEdgeBarWorld(wallsRoot.transform, vPos + new Vector3(-halfWT, wh * 0.5f, halfWT), new Vector3(ew, wh + ew, ew));
-                if (hasS == hasE) // SE corner (+X, -Z)
-                    CreateBlackEdgeBarWorld(wallsRoot.transform, vPos + new Vector3(halfWT, wh * 0.5f, -halfWT), new Vector3(ew, wh + ew, ew));
-                if (hasS == hasW) // SW corner (-X, -Z)
+                if (hasN == hasE)
+                    CreateBlackEdgeBarWorld(wallsRoot.transform, vPos + new Vector3( halfWT, wh * 0.5f,  halfWT), new Vector3(ew, wh + ew, ew));
+                if (hasN == hasW)
+                    CreateBlackEdgeBarWorld(wallsRoot.transform, vPos + new Vector3(-halfWT, wh * 0.5f,  halfWT), new Vector3(ew, wh + ew, ew));
+                if (hasS == hasE)
+                    CreateBlackEdgeBarWorld(wallsRoot.transform, vPos + new Vector3( halfWT, wh * 0.5f, -halfWT), new Vector3(ew, wh + ew, ew));
+                if (hasS == hasW)
                     CreateBlackEdgeBarWorld(wallsRoot.transform, vPos + new Vector3(-halfWT, wh * 0.5f, -halfWT), new Vector3(ew, wh + ew, ew));
             }
         }
@@ -625,9 +909,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     {
         GameObject colObj = new GameObject("WallCollider");
         colObj.transform.SetParent(parent, false);
-        colObj.transform.position = worldPos;
+        // Raise invisible wall collider height to 4.5m so teleport arcs can NEVER lob over low 0.85m walls!
+        colObj.transform.position = new Vector3(worldPos.x, 2.25f, worldPos.z);
         BoxCollider bc = colObj.AddComponent<BoxCollider>();
-        bc.size = size;
+        bc.size = new Vector3(size.x, 4.5f, size.z);
     }
 
     void BuildUnoccupiedCheckerboardCell(int r, int c)
@@ -635,6 +920,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         Vector3 center = CellToWorldCenter(r, c, 0f);
         GameObject chkObj = GameObject.CreatePrimitive(PrimitiveType.Cube);
         chkObj.name = $"CheckerBlock_{r}_{c}";
+        // No TeleportationArea on Checkerboard blocks so player cannot teleport out of bounds!
         Destroy(chkObj.GetComponent<Collider>());
         chkObj.transform.SetParent(mazeRoot.transform, false);
 
@@ -655,7 +941,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         cellObj.transform.SetParent(mazeRoot.transform, false);
         cellObj.transform.position = center;
 
-        // 1. White Base Floor
+        // 1. White Base Floor (with properly configured XR TeleportationArea!)
         GameObject floor = GameObject.CreatePrimitive(PrimitiveType.Cube);
         floor.name = "WhiteFloor";
         floor.transform.SetParent(cellObj.transform, false);
@@ -664,6 +950,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         floor.transform.localScale = floorScale;
         NormalizeMeshUVsToWorldSpacePosition(floor, PrimitiveType.Cube, center + new Vector3(0f, -0.05f, 0f), floorScale);
         floor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
+
+        ConfigureFloorTeleportationArea(floor);
 
         // 2. Inset 3D Black Breadcrumb Overlay
         float crumbWidth = cellSize * 0.625f;
@@ -753,10 +1041,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
 
         BoxCollider col = wallGroup.AddComponent<BoxCollider>();
-        col.center = new Vector3(0f, 0.9f, 0f);
+        col.center = new Vector3(0f, 2.25f, 0f);
         col.size = alongZ
-            ? new Vector3(wallThickness, 1.8f, length + wallThickness)
-            : new Vector3(length + wallThickness, 1.8f, wallThickness);
+            ? new Vector3(wallThickness, 4.5f, length + wallThickness)
+            : new Vector3(length + wallThickness, 4.5f, wallThickness);
     }
 
     GameObject CreateCrumbPiece(Transform parent, string name, Vector3 cellWorldCenter, Vector3 localPos, Vector3 scale)
@@ -817,6 +1105,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         mac2DMapTex = new Texture2D(w, h, TextureFormat.RGBA32, false);
         mac2DMapTex.filterMode = FilterMode.Point;
         mac2DMapTex.wrapMode = TextureWrapMode.Clamp;
+        if (wristMapMaterial != null) wristMapMaterial.mainTexture = mac2DMapTex;
     }
 
     void SetPixelFB(int x, int y, byte val)
@@ -861,16 +1150,16 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         FillGrayRectFB(ox, oy, 16, 16);
 
-        byte wBase = MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BASE);
+        byte wBase   = MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BASE);
         byte wBridge = MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BRIDGE);
-        byte nBase = MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BASE);
+        byte nBase   = MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BASE);
         byte nBridge = MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BRIDGE);
 
-        int wBaseOpen = wBase & 0x0F;
+        int wBaseOpen   = wBase & 0x0F;
         int wBridgeOpen = wBridge & 0x0F;
-        int nBaseOpen = nBase & 0x0F;
+        int nBaseOpen   = nBase & 0x0F;
         int nBridgeOpen = nBridge & 0x0F;
-        bool isRamp = MazeData.IsRamp(r, c);
+        bool isRamp     = MazeData.IsRamp(r, c);
 
         void DrawWideCorridor(int openMask)
         {
@@ -902,10 +1191,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 FillRectFB(ox + 14, oy + 14, 1, 2, 1);
             }
 
-            if ((openMask & (1 << AmazingMazeData.DIR_LEFT)) == 0) FillRectFB(ox + 1, oy + 1, 1, 14, 1);
+            if ((openMask & (1 << AmazingMazeData.DIR_LEFT)) == 0)  FillRectFB(ox + 1, oy + 1, 1, 14, 1);
             if ((openMask & (1 << AmazingMazeData.DIR_RIGHT)) == 0) FillRectFB(ox + 14, oy + 1, 1, 14, 1);
-            if ((openMask & (1 << AmazingMazeData.DIR_UP)) == 0) FillRectFB(ox + 1, oy + 1, 14, 1, 1);
-            if ((openMask & (1 << AmazingMazeData.DIR_DOWN)) == 0) FillRectFB(ox + 1, oy + 14, 14, 1, 1);
+            if ((openMask & (1 << AmazingMazeData.DIR_UP)) == 0)    FillRectFB(ox + 1, oy + 1, 14, 1, 1);
+            if ((openMask & (1 << AmazingMazeData.DIR_DOWN)) == 0)  FillRectFB(ox + 1, oy + 14, 14, 1, 1);
 
             SetPixelFB(ox + 1, oy + 1, 1);
             SetPixelFB(ox + 14, oy + 1, 1);
@@ -960,10 +1249,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 FillRectFB(ox + 10, oy + 10, 1, 6, 1);
             }
 
-            if ((openMask & (1 << AmazingMazeData.DIR_LEFT)) == 0) FillRectFB(ox + 5, oy + 5, 1, 6, 1);
+            if ((openMask & (1 << AmazingMazeData.DIR_LEFT)) == 0)  FillRectFB(ox + 5, oy + 5, 1, 6, 1);
             if ((openMask & (1 << AmazingMazeData.DIR_RIGHT)) == 0) FillRectFB(ox + 10, oy + 5, 1, 6, 1);
-            if ((openMask & (1 << AmazingMazeData.DIR_UP)) == 0) FillRectFB(ox + 5, oy + 5, 6, 1, 1);
-            if ((openMask & (1 << AmazingMazeData.DIR_DOWN)) == 0) FillRectFB(ox + 5, oy + 10, 6, 1, 1);
+            if ((openMask & (1 << AmazingMazeData.DIR_UP)) == 0)    FillRectFB(ox + 5, oy + 5, 6, 1, 1);
+            if ((openMask & (1 << AmazingMazeData.DIR_DOWN)) == 0)  FillRectFB(ox + 5, oy + 10, 6, 1, 1);
 
             SetPixelFB(ox + 5, oy + 5, 1);
             SetPixelFB(ox + 10, oy + 5, 1);
@@ -999,18 +1288,18 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             if (AmazingMazeData.IsWideSubLayer(subLayer))
             {
                 FillRectFB(ox + 3, oy + 3, 10, 10, 1);
-                if ((nibs & (1 << AmazingMazeData.DIR_LEFT)) != 0) FillRectFB(ox, oy + 3, 3, 10, 1);
+                if ((nibs & (1 << AmazingMazeData.DIR_LEFT)) != 0)  FillRectFB(ox, oy + 3, 3, 10, 1);
                 if ((nibs & (1 << AmazingMazeData.DIR_RIGHT)) != 0) FillRectFB(ox + 13, oy + 3, 3, 10, 1);
-                if ((nibs & (1 << AmazingMazeData.DIR_UP)) != 0) FillRectFB(ox + 3, oy, 10, 3, 1);
-                if ((nibs & (1 << AmazingMazeData.DIR_DOWN)) != 0) FillRectFB(ox + 3, oy + 13, 10, 3, 1);
+                if ((nibs & (1 << AmazingMazeData.DIR_UP)) != 0)    FillRectFB(ox + 3, oy, 10, 3, 1);
+                if ((nibs & (1 << AmazingMazeData.DIR_DOWN)) != 0)  FillRectFB(ox + 3, oy + 13, 10, 3, 1);
             }
             else
             {
                 FillRectFB(ox + 7, oy + 7, 2, 2, 1);
-                if ((nibs & (1 << AmazingMazeData.DIR_LEFT)) != 0) FillRectFB(ox, oy + 7, 7, 2, 1);
+                if ((nibs & (1 << AmazingMazeData.DIR_LEFT)) != 0)  FillRectFB(ox, oy + 7, 7, 2, 1);
                 if ((nibs & (1 << AmazingMazeData.DIR_RIGHT)) != 0) FillRectFB(ox + 9, oy + 7, 7, 2, 1);
-                if ((nibs & (1 << AmazingMazeData.DIR_UP)) != 0) FillRectFB(ox + 7, oy, 2, 7, 1);
-                if ((nibs & (1 << AmazingMazeData.DIR_DOWN)) != 0) FillRectFB(ox + 7, oy + 9, 2, 7, 1);
+                if ((nibs & (1 << AmazingMazeData.DIR_UP)) != 0)    FillRectFB(ox + 7, oy, 2, 7, 1);
+                if ((nibs & (1 << AmazingMazeData.DIR_DOWN)) != 0)  FillRectFB(ox + 7, oy + 9, 2, 7, 1);
             }
         }
 
@@ -1091,7 +1380,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         return !(hasNeg && hasPos);
     }
 
-    // Flushes fbPixels to mac2DMapTex and rasterizes a smooth, continuous-angle & sub-pixel position wedge
     void FlushFramebufferWithPlayerWedge()
     {
         if (mac2DMapTex == null) return;
@@ -1109,30 +1397,26 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             }
         }
 
-        if (playerObject != null)
+        if (activePlayerHeadOrBody != null)
         {
-            // Map exact 3D world position continuously to 2D framebuffer coordinates!
-            // Cell (1, 1) center (0, 0, 0) maps to (MARGIN_X + 7.5, MARGIN_Y + 7.5)
-            Vector3 wp = playerObject.transform.position;
+            Vector3 wp = activePlayerHeadOrBody.position;
             float exactMapX = MARGIN_X + 7.5f + (wp.x / cellSize) * TILE_STRIDE;
             float exactMapY = MARGIN_Y + 7.5f + (-wp.z / cellSize) * TILE_STRIDE;
             Vector2 center = new Vector2(exactMapX, exactMapY);
 
-            // Convert smooth 3D yaw (0 = North/-Y in top-down map, 90 = East/+X) into 2D screen vectors
-            float rad = playerObject.transform.eulerAngles.y * Mathf.Deg2Rad;
+            float rad = activePlayerHeadOrBody.eulerAngles.y * Mathf.Deg2Rad;
             Vector2 fwd = new Vector2(Mathf.Sin(rad), -Mathf.Cos(rad));
             Vector2 right = new Vector2(-fwd.y, fwd.x);
 
-            // Crisp vector dart/wedge vertices (Tip, Left Wing, Notch, Right Wing)
-            Vector2 tip = center + fwd * 5.2f;
-            Vector2 leftWing = center - fwd * 3.8f - right * 3.8f;
+            Vector2 tip       = center + fwd * 5.2f;
+            Vector2 leftWing  = center - fwd * 3.8f - right * 3.8f;
             Vector2 rightWing = center - fwd * 3.8f + right * 3.8f;
-            Vector2 notch = center - fwd * 1.5f;
+            Vector2 notch     = center - fwd * 1.5f;
 
             int pr = MazeData.PlayerPos.r;
             int pc = MazeData.PlayerPos.c;
             bool cellOccupied = (MazeData.GetSquare(pr, pc, MazeData.PlayerPos.layer) & 0x30) != 0;
-            Color32 fg = cellOccupied ? white : black;
+            Color32 fg   = cellOccupied ? white : black;
             Color32 halo = cellOccupied ? black : white;
 
             int minX = Mathf.Max(0, Mathf.FloorToInt(exactMapX - 7));
@@ -1140,7 +1424,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             int minY = Mathf.Max(0, Mathf.FloorToInt(exactMapY - 7));
             int maxY = Mathf.Min(fbHeight - 1, Mathf.CeilToInt(exactMapY + 7));
 
-            // Pass 1: 1px Contrast Halo around the rotated dart
             for (int py = minY; py <= maxY; py++)
             {
                 for (int px = minX; px <= maxX; px++)
@@ -1162,7 +1445,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 }
             }
 
-            // Pass 2: Crisp Continuous-Angle Dart Foreground
             for (int py = minY; py <= maxY; py++)
             {
                 for (int px = minX; px <= maxX; px++)
@@ -1182,7 +1464,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     void SpawnSimpleDesktopPlayer()
     {
-        playerObject = new GameObject("DesktopPlayer");
+        GameObject playerObject = new GameObject("DesktopPlayer");
         CharacterController cc = playerObject.AddComponent<CharacterController>();
         cc.radius = 0.35f;
         cc.height = 1.7f;
@@ -1205,12 +1487,13 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             cam.transform.localRotation = Quaternion.identity;
         }
 
-        playerObject.AddComponent<SimpleDesktopMazeWalker>().Init(this, cc, cam.transform);
+        activePlayerHeadOrBody = playerObject.transform;
+        playerObject.AddComponent<SimpleDesktopMazeWalker>().Init(this, cc, cam != null ? cam.transform : null);
     }
 
     void OnGUI()
     {
-        if (mac2DMapTex != null)
+        if (showDesktopHudMap && mac2DMapTex != null)
         {
             GUI.DrawTexture(
                 new Rect(12, 12, mac2DMapTex.width * hudMapScale, mac2DMapTex.height * hudMapScale),
@@ -1249,6 +1532,7 @@ public class SimpleDesktopMazeWalker : MonoBehaviour
 
     void Update()
     {
+#if ENABLE_LEGACY_INPUT_MANAGER
         if (Input.GetKeyDown(KeyCode.Escape))
         {
             if (Cursor.lockState == CursorLockMode.Locked) UnlockCursor();
@@ -1272,14 +1556,6 @@ public class SimpleDesktopMazeWalker : MonoBehaviour
         float v = Input.GetAxisRaw("Vertical");
         Vector3 move = (transform.right * h + transform.forward * v).normalized * 4.5f;
         cc.SimpleMove(move);
-
-        var (curR, curC) = builder.WorldToCell(transform.position);
-        if (curR != builder.MazeData.PlayerPos.r || curC != builder.MazeData.PlayerPos.c)
-        {
-            if (builder.MazeData.TryStepToAdjacentCell(curR, curC))
-            {
-                builder.UpdateBreadcrumbsAnd2DMap();
-            }
-        }
+#endif
     }
 }
