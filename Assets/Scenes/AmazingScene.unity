@@ -157,10 +157,15 @@ MonoBehaviour:
   wristMapLocalPosition: {x: 0.06, y: 0.05, z: -0.08}
   wristMapLocalEuler: {x: 45, y: 20, z: 0}
   wristMapWidthMeters: 0.18
+  isRunMode: 0
+  walkSpeed: 3.2
+  runSpeed: 7.2
+  maxTeleportCellsPerJump: 6
   architectureStyle: 0
-  skillLevel: 0
+  skillLevel: 1
   cellSize: 3
   wallHeight: 0.85
+  tunnelArchHeight: 2.4
   wallThickness: 0.35
   blackEdgeOutlineWidth: 0.03
   fillUnoccupiedWithCheckerboard: 1
