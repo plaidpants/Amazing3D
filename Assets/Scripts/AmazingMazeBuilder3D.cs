@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 #if UNITY_EDITOR
 using UnityEditor;
@@ -14,13 +15,19 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     }
 
     [Header("VR / XR Setup (Drag 'XR Origin (XR Rig)' here!)")]
-    [Tooltip("If assigned, uses this XR Rig for VR and attaches the 2D Mac Map to the Left Controller! If left empty, spawns the Desktop WASD player.")]
     public Transform xrRigRoot;
-    [Tooltip("Optional: Drag Left Controller Transform here. If blank, auto-searches inside xrRigRoot.")]
     public Transform leftWristTransform;
     public Vector3 wristMapLocalPosition = new Vector3(0.06f, 0.05f, -0.08f);
     public Vector3 wristMapLocalEuler = new Vector3(45f, 20f, 0f);
     public float wristMapWidthMeters = 0.18f;
+
+    [Header("Locomotion: Walk / Run Mode & Teleport Settings")]
+    [Tooltip("Toggle Run Mode in VR with A/X button or Thumbstick Click (or Left Shift on Desktop)")]
+    public bool isRunMode = false;
+    public float walkSpeed = 3.2f;
+    public float runSpeed = 7.2f;
+    [Tooltip("Maximum number of corridor cells you can teleport in a single jump (prevents skipping the whole maze at once while still filling every intermediate cell's breadcrumb)")]
+    [Range(1, 20)] public int maxTeleportCellsPerJump = 6;
 
     [Header("Architecture & Maze Settings (Press TAB in Play Mode to toggle style!)")]
     public WallArchitectureStyle architectureStyle = WallArchitectureStyle.FlatEdgedMac1Bit;
@@ -83,7 +90,29 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     private WallArchitectureStyle lastBuiltStyle;
     private Vector3 lastPlayerPos;
     private float lastPlayerYaw = -999f;
+
+    // XRI Reflection caches for Teleport & Move Speed
     private Type teleportAreaType;
+    private object cachedTeleportProvider;
+    private object cachedMoveProvider;
+    private PropertyInfo moveSpeedProp;
+    private List<MonoBehaviour> teleportRayInteractors = new List<MonoBehaviour>();
+    private MethodInfo tryGetHitInfoMethod;
+
+    // Direct Teleport Fallback & Visual Reticle state
+    private bool wasTeleportRayActiveLastFrame = false;
+    private bool hasValidPendingTeleportHit = false;
+    private Vector3 pendingTeleportWorldHit;
+
+    private GameObject teleportReticleObj;
+    private Renderer teleportReticleRenderer;
+    private Texture2D validTargetTex;
+    private Texture2D invalidXTex;
+    private Gradient blueValidGradient;
+    private Gradient redInvalidGradient;
+
+    // Run toggle button debounce
+    private bool runButtonWasPressed = false;
 
     private static readonly byte[] CIRCLE_ROWS = new byte[]
     {
@@ -97,11 +126,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         0b00111100
     };
 
-    private object cachedTeleportProvider;
-
     void Start()
     {
-        // Locate XR Interaction Toolkit's TeleportationArea type across XRI 2.x and 3.x
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             teleportAreaType = asm.GetType("UnityEngine.XR.Interaction.Toolkit.Locomotion.Teleportation.TeleportationArea")
@@ -114,7 +140,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         MazeData.MakeMaze(skillLevel);
 
         if (xrRigRoot != null)
-            CacheTeleportProviderAndHardenRays();
+            CacheXRLocomotionAndTeleportComponents();
 
         RebuildMazeGeometryOnly();
 
@@ -123,93 +149,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         else
             SpawnSimpleDesktopPlayer();
 
+        ApplyMoveSpeedToXR();
         ConfigureCameraAndGlobalDither();
         UpdateBreadcrumbsAnd2DMap();
-    }
-
-    // Finds the TeleportationProvider on the XR Rig and flattens the Teleport Ray so it cannot lob over walls!
-    void CacheTeleportProviderAndHardenRays()
-    {
-        foreach (MonoBehaviour mb in xrRigRoot.GetComponentsInChildren<MonoBehaviour>(true))
-        {
-            if (mb == null) continue;
-            Type t = mb.GetType();
-
-            if (t.Name == "TeleportationProvider")
-            {
-                cachedTeleportProvider = mb;
-            }
-            else if (t.Name == "XRRayInteractor")
-            {
-                // Make sure the Teleport Interactor ray uses a fast, flat trajectory (velocity = 22)
-                // and cannot arc over the 4.5m tall invisible wall colliders!
-                string goName = mb.gameObject.name.ToLowerInvariant();
-                if (goName.Contains("teleport"))
-                {
-                    var velProp = t.GetProperty("velocity");
-                    velProp?.SetValue(mb, 24f); // Flatter arc
-
-                    // Enable all InteractionLayers (~0) on Teleport Interactor so it always recognizes floor TeleportationAreas
-                    var maskProp = t.GetProperty("interactionLayers");
-                    if (maskProp != null)
-                    {
-                        object maskStruct = maskProp.GetValue(mb);
-                        var valField = maskStruct?.GetType().GetField("m_Bits", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-                                    ?? maskStruct?.GetType().GetField("value", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-                        if (valField != null)
-                        {
-                            valField.SetValue(maskStruct, unchecked((uint)~0));
-                            maskProp.SetValue(mb, maskStruct);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Properly wires up TeleportationArea at runtime (InteractionLayers = Everything, Colliders list, and TeleportationProvider)
-    void ConfigureFloorTeleportationArea(GameObject floor)
-    {
-        if (teleportAreaType == null) return;
-
-        // Deactivate floor briefly before adding TeleportationArea so OnEnable registers the collider cleanly!
-        floor.SetActive(false);
-        Component teleArea = floor.AddComponent(teleportAreaType);
-
-        // 1. Assign the floor's BoxCollider to TeleportationArea.colliders
-        var collidersProp = teleportAreaType.GetProperty("colliders");
-        if (collidersProp != null)
-        {
-            var colList = collidersProp.GetValue(teleArea) as System.Collections.IList;
-            if (colList != null)
-            {
-                colList.Clear();
-                colList.Add(floor.GetComponent<Collider>());
-            }
-        }
-
-        // 2. Assign TeleportationProvider reference if found
-        if (cachedTeleportProvider != null)
-        {
-            var providerProp = teleportAreaType.GetProperty("teleportationProvider");
-            providerProp?.SetValue(teleArea, cachedTeleportProvider);
-        }
-
-        // 3. Set InteractionLayerMask to Everything (~0) so the Teleport Interactor (Bit 31) ALWAYS matches!
-        var maskProp = teleportAreaType.GetProperty("interactionLayers");
-        if (maskProp != null)
-        {
-            object maskStruct = maskProp.GetValue(teleArea);
-            var valField = maskStruct?.GetType().GetField("m_Bits", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-                        ?? maskStruct?.GetType().GetField("value", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-            if (valField != null)
-            {
-                valField.SetValue(maskStruct, unchecked((uint)~0));
-                maskProp.SetValue(teleArea, maskStruct);
-            }
-        }
-
-        floor.SetActive(true);
     }
 
     void Update()
@@ -223,10 +165,23 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             RebuildMazeGeometryOnly();
             UpdateBreadcrumbsAnd2DMap();
         }
+        if (Input.GetKeyDown(KeyCode.LeftShift) || Input.GetKeyDown(KeyCode.RightShift))
+        {
+            ToggleRunMode();
+        }
 #endif
         if (activePlayerHeadOrBody == null) return;
 
-        // Track player movement across grid cells (Smooth Walk, Roomscale, and Teleport!)
+        // 1. Check VR Controller Run Mode Toggle (Primary Button A/X or Thumbstick Click)
+        PollVRRunModeToggle();
+
+        // 2. Monitor VR Teleport Ray Interactors & Execute Valid Straight-Hallway Teleports on Release!
+        if (xrRigRoot != null)
+        {
+            MonitorAndExecuteVRTeleport();
+        }
+
+        // 3. Track player movement across grid cells (Smooth Walk, Roomscale, and Teleport!)
         Vector3 curPos = activePlayerHeadOrBody.position;
         var (curR, curC) = WorldToCell(curPos);
         if (curR != MazeData.PlayerPos.r || curC != MazeData.PlayerPos.c)
@@ -234,7 +189,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             StepPlayerTowardCell(curR, curC);
         }
 
-        // Continuously update the player's exact position and smooth rotation wedge on the 2D map
+        // 4. Continuously update the player's exact position and smooth rotation wedge on the 2D map
         float curYaw = activePlayerHeadOrBody.eulerAngles.y;
         if ((curPos - lastPlayerPos).sqrMagnitude > 0.0001f || Mathf.Abs(Mathf.DeltaAngle(curYaw, lastPlayerYaw)) > 0.25f)
         {
@@ -244,21 +199,341 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
     }
 
-    // Validates every single step (walking or multi-cell teleport) against the maze walls!
-    // If a teleport ever tries to jump across a wall or diagonally through a corner, it clamps
-    // the player to the furthest legal cell before the wall so cheating is impossible.
+    public void ToggleRunMode()
+    {
+        isRunMode = !isRunMode;
+        ApplyMoveSpeedToXR();
+        FlushFramebufferWithPlayerWedge();
+    }
+
+    void ApplyMoveSpeedToXR()
+    {
+        if (cachedMoveProvider != null && moveSpeedProp != null)
+        {
+            moveSpeedProp.SetValue(cachedMoveProvider, isRunMode ? runSpeed : walkSpeed);
+        }
+    }
+
+    // Polls UnityEngine.XR.InputDevices for PrimaryButton (A/X) or Primary2DAxisClick (Thumbstick press) to toggle Run Mode
+    void PollVRRunModeToggle()
+    {
+        var rightHand = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(UnityEngine.XR.XRNode.RightHand);
+        var leftHand  = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(UnityEngine.XR.XRNode.LeftHand);
+
+        bool aPressed = false, xPressed = false, rStickClick = false, lStickClick = false;
+        if (rightHand.isValid)
+        {
+            rightHand.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primaryButton, out aPressed);
+            rightHand.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primary2DAxisClick, out rStickClick);
+        }
+        if (leftHand.isValid)
+        {
+            leftHand.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primaryButton, out xPressed);
+            leftHand.TryGetFeatureValue(UnityEngine.XR.CommonUsages.primary2DAxisClick, out lStickClick);
+        }
+
+        bool anyRunBtn = aPressed || xPressed || rStickClick || lStickClick;
+        if (anyRunBtn && !runButtonWasPressed)
+        {
+            ToggleRunMode();
+        }
+        runButtonWasPressed = anyRunBtn;
+    }
+
+    /* ============================================================================
+     * STRAIGHT-HALLWAY TELEPORT VALIDATOR & DIRECT TELEPORT EXECUTOR
+     * Ensures:
+     *   1. Teleport works reliably even if XRI's InteractionLayerMask was mismatched.
+     *   2. You can only teleport along an unbroken, straight corridor from your
+     *      current cell (clamped to maxTeleportCellsPerJump), filling in EVERY
+     *      intermediate cell's black breadcrumb so the solution path never breaks!
+     * ============================================================================ */
+    /* ============================================================================
+     * TELEPORT VISUAL RETICLE (BLUE TARGET ? vs RED X ?) & ARC COLOR CONTROLLER
+     * ============================================================================ */
+    void EnsureTeleportReticleAndGradients()
+    {
+        if (blueValidGradient == null)
+        {
+            blueValidGradient = new Gradient();
+            blueValidGradient.SetKeys(
+                new GradientColorKey[] { new GradientColorKey(new Color(0.1f, 0.55f, 1f), 0f), new GradientColorKey(new Color(0.2f, 0.75f, 1f), 1f) },
+                new GradientAlphaKey[] { new GradientAlphaKey(0.95f, 0f), new GradientAlphaKey(1f, 1f) }
+            );
+
+            redInvalidGradient = new Gradient();
+            redInvalidGradient.SetKeys(
+                new GradientColorKey[] { new GradientColorKey(new Color(1f, 0.15f, 0.15f), 0f), new GradientColorKey(new Color(1f, 0.1f, 0.1f), 1f) },
+                new GradientAlphaKey[] { new GradientAlphaKey(0.95f, 0f), new GradientAlphaKey(1f, 1f) }
+            );
+        }
+
+        if (validTargetTex == null)
+        {
+            // 32x32 Crisp Blue Target Reticle (Outer Ring + Inner Ring + Crosshair Ticks)
+            validTargetTex = new Texture2D(32, 32, TextureFormat.RGBA32, false);
+            validTargetTex.filterMode = FilterMode.Point;
+            validTargetTex.wrapMode = TextureWrapMode.Clamp;
+            Color32[] cols = new Color32[32 * 32];
+            Color32 blue = new Color32(30, 160, 255, 255);
+            Color32 white = new Color32(255, 255, 255, 255);
+            Color32 clear = new Color32(0, 0, 0, 0);
+
+            for (int y = 0; y < 32; y++)
+            {
+                for (int x = 0; x < 32; x++)
+                {
+                    float dx = x - 15.5f;
+                    float dy = y - 15.5f;
+                    float dist = Mathf.Sqrt(dx * dx + dy * dy);
+
+                    bool outerRing = (dist >= 12.0f && dist <= 14.8f);
+                    bool innerRing = (dist >= 5.0f && dist <= 7.2f);
+                    bool centerDot = (dist <= 2.0f);
+                    bool crossTicks = (Mathf.Abs(dx) <= 1.2f && Mathf.Abs(dy) >= 8.5f && Mathf.Abs(dy) <= 14.5f) ||
+                                      (Mathf.Abs(dy) <= 1.2f && Mathf.Abs(dx) >= 8.5f && Mathf.Abs(dx) <= 14.5f);
+
+                    if (outerRing || innerRing || centerDot || crossTicks)
+                        cols[y * 32 + x] = blue;
+                    else if (Mathf.Abs(dist - 11.5f) < 0.8f || Mathf.Abs(dist - 15.3f) < 0.8f)
+                        cols[y * 32 + x] = white; // Crisp 1px white outline so it pops on black breadcrumbs too!
+                    else
+                        cols[y * 32 + x] = clear;
+                }
+            }
+            validTargetTex.SetPixels32(cols);
+            validTargetTex.Apply();
+        }
+
+        if (invalidXTex == null)
+        {
+            // 32x32 Crisp Red 'X' Reticle
+            invalidXTex = new Texture2D(32, 32, TextureFormat.RGBA32, false);
+            invalidXTex.filterMode = FilterMode.Point;
+            invalidXTex.wrapMode = TextureWrapMode.Clamp;
+            Color32[] cols = new Color32[32 * 32];
+            Color32 red = new Color32(255, 40, 40, 255);
+            Color32 white = new Color32(255, 255, 255, 255);
+            Color32 clear = new Color32(0, 0, 0, 0);
+
+            for (int y = 0; y < 32; y++)
+            {
+                for (int x = 0; x < 32; x++)
+                {
+                    float dx = x - 15.5f;
+                    float dy = y - 15.5f;
+                    if (Mathf.Abs(dx) > 12.5f || Mathf.Abs(dy) > 12.5f)
+                    {
+                        cols[y * 32 + x] = clear;
+                        continue;
+                    }
+
+                    float d1 = Mathf.Abs(dx - dy);
+                    float d2 = Mathf.Abs(dx + dy);
+                    float minDiag = Mathf.Min(d1, d2);
+
+                    if (minDiag <= 2.6f)
+                        cols[y * 32 + x] = red;
+                    else if (minDiag <= 3.8f)
+                        cols[y * 32 + x] = white; // White outline
+                    else
+                        cols[y * 32 + x] = clear;
+                }
+            }
+            invalidXTex.SetPixels32(cols);
+            invalidXTex.Apply();
+        }
+
+        if (teleportReticleObj == null)
+        {
+            teleportReticleObj = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            teleportReticleObj.name = "TeleportFloorReticle";
+            Destroy(teleportReticleObj.GetComponent<Collider>());
+            teleportReticleObj.transform.rotation = Quaternion.Euler(90f, 0f, 0f); // Lie flat on floor
+            teleportReticleObj.transform.localScale = new Vector3(0.75f, 0.75f, 1f);
+
+            // Use Unlit/Transparent (or Sprites/Default) so the alpha-cutout Target & X render cleanly
+            Shader transShader = Shader.Find("Unlit/Transparent");
+            if (transShader == null) transShader = Shader.Find("Sprites/Default");
+            teleportReticleRenderer = teleportReticleObj.GetComponent<Renderer>();
+            teleportReticleRenderer.sharedMaterial = new Material(transShader);
+            teleportReticleObj.SetActive(false);
+        }
+    }
+
+    void MonitorAndExecuteVRTeleport()
+    {
+        EnsureTeleportReticleAndGradients();
+
+        bool anyTeleportRayActive = false;
+        bool showReticleThisFrame = false;
+
+        foreach (MonoBehaviour rayInteractor in teleportRayInteractors)
+        {
+            if (rayInteractor == null) continue;
+            if (!rayInteractor.gameObject.activeInHierarchy || !rayInteractor.enabled) continue;
+
+            anyTeleportRayActive = true;
+
+            if (tryGetHitInfoMethod != null)
+            {
+                object[] args = new object[] { Vector3.zero, Vector3.zero, 0, false };
+                bool hitAnything = (bool)tryGetHitInfoMethod.Invoke(rayInteractor, args);
+                if (hitAnything)
+                {
+                    Vector3 hitPos = (Vector3)args[0];
+                    Vector3 hitNormal = (Vector3)args[1];
+
+                    var (hitR, hitC) = WorldToCell(hitPos);
+                    bool isFloorHit = hitNormal.y > 0.7f;
+                    bool isLegalCorridorJump = isFloorHit &&
+                                               IsLegalStraightCorridorTeleport(hitR, hitC, out int clampedR, out int clampedC) &&
+                                               (clampedR == hitR && clampedC == hitC) &&
+                                               !(hitR == MazeData.PlayerPos.r && hitC == MazeData.PlayerPos.c);
+
+                    if (isLegalCorridorJump)
+                    {
+                        hasValidPendingTeleportHit = true;
+                        pendingTeleportWorldHit = hitPos;
+
+                        // Turn arc BLUE and place Blue Target (?) on the floor!
+                        SetTeleportRayVisualColor(rayInteractor.gameObject, true);
+                        teleportReticleObj.transform.position = new Vector3(hitPos.x, 0.025f, hitPos.z);
+                        teleportReticleObj.transform.rotation = Quaternion.Euler(90f, 0f, 0f);
+                        teleportReticleRenderer.sharedMaterial.mainTexture = validTargetTex;
+                        showReticleThisFrame = true;
+                    }
+                    else
+                    {
+                        hasValidPendingTeleportHit = false;
+
+                        // Turn arc RED and place Red X (?) at the invalid floor/wall point!
+                        SetTeleportRayVisualColor(rayInteractor.gameObject, false);
+                        teleportReticleObj.transform.position = hitPos + hitNormal * 0.03f;
+                        teleportReticleObj.transform.rotation = Quaternion.LookRotation(-hitNormal);
+                        teleportReticleRenderer.sharedMaterial.mainTexture = invalidXTex;
+                        showReticleThisFrame = true;
+                    }
+                }
+                else
+                {
+                    hasValidPendingTeleportHit = false;
+                    SetTeleportRayVisualColor(rayInteractor.gameObject, false);
+                }
+            }
+        }
+
+        if (teleportReticleObj != null && teleportReticleObj.activeSelf != showReticleThisFrame)
+        {
+            teleportReticleObj.SetActive(showReticleThisFrame);
+        }
+
+        // Execute teleport on thumbstick release if pointing at a valid Blue Target cell!
+        if (wasTeleportRayActiveLastFrame && !anyTeleportRayActive && hasValidPendingTeleportHit)
+        {
+            hasValidPendingTeleportHit = false;
+            var (targetR, targetC) = WorldToCell(pendingTeleportWorldHit);
+
+            if (IsLegalStraightCorridorTeleport(targetR, targetC, out int clampedR, out int clampedC))
+            {
+                Vector3 destWorld = CellToWorldCenter(clampedR, clampedC, xrRigRoot.position.y);
+                Vector3 headOffset = activePlayerHeadOrBody.position - xrRigRoot.position;
+                headOffset.y = 0f;
+                xrRigRoot.position = destWorld - headOffset;
+
+                StepPlayerTowardCell(clampedR, clampedC);
+            }
+        }
+
+        if (!anyTeleportRayActive)
+        {
+            hasValidPendingTeleportHit = false;
+        }
+        wasTeleportRayActiveLastFrame = anyTeleportRayActive;
+    }
+
+    // Checks if (targetR, targetC) is reachable via a straight cardinal corridor
+    // without crossing any walls, and within maxTeleportCellsPerJump!
+    bool IsLegalStraightCorridorTeleport(int targetR, int targetC, out int clampedR, out int clampedC)
+    {
+        clampedR = MazeData.PlayerPos.r;
+        clampedC = MazeData.PlayerPos.c;
+
+        int dr = targetR - clampedR;
+        int dc = targetC - clampedC;
+
+        if (dr != 0 && dc != 0)
+            return false;
+
+        if (dr == 0 && dc == 0)
+            return true;
+
+        int dir = -1;
+        int dist = Mathf.Abs(dr) + Mathf.Abs(dc);
+        if (dist > maxTeleportCellsPerJump)
+            return false; // Beyond max jump range -> show Red X!
+
+        if (dc < 0) dir = AmazingMazeData.DIR_LEFT;
+        else if (dr > 0) dir = AmazingMazeData.DIR_DOWN;
+        else if (dc > 0) dir = AmazingMazeData.DIR_RIGHT;
+        else if (dr < 0) dir = AmazingMazeData.DIR_UP;
+
+        int simR = MazeData.PlayerPos.r;
+        int simC = MazeData.PlayerPos.c;
+        int simLayer = MazeData.PlayerPos.layer;
+
+        for (int s = 0; s < dist; s++)
+        {
+            var stepOpt = MazeData.CanMove(simR, simC, simLayer, dir);
+            if (!stepOpt.HasValue) return false; // Blocked by a wall!
+            simR = stepOpt.Value.r;
+            simC = stepOpt.Value.c;
+            simLayer = stepOpt.Value.layer;
+        }
+
+        clampedR = simR;
+        clampedC = simC;
+        return true;
+    }
+
+    // Overrides BOTH XRInteractorLineVisual's color gradients AND LineRenderer so XRI never overwrites our Blue/Red state!
+    void SetTeleportRayVisualColor(GameObject rayObj, bool isValidBlue)
+    {
+        Gradient activeGrad = isValidBlue ? blueValidGradient : redInvalidGradient;
+
+        foreach (MonoBehaviour mb in rayObj.GetComponents<MonoBehaviour>())
+        {
+            if (mb == null) continue;
+            Type t = mb.GetType();
+            if (t.Name == "XRInteractorLineVisual")
+            {
+                var validProp = t.GetProperty("validColorGradient");
+                var invalidProp = t.GetProperty("invalidColorGradient");
+                validProp?.SetValue(mb, activeGrad);
+                invalidProp?.SetValue(mb, activeGrad);
+            }
+        }
+
+        LineRenderer lr = rayObj.GetComponent<LineRenderer>();
+        if (lr != null)
+        {
+            lr.colorGradient = activeGrad;
+        }
+    }
+
+    // Steps through EVERY intermediate cell one by one so teleporting down a long hallway
+    // unrolls the continuous black breadcrumb path without skipping a single square!
     void StepPlayerTowardCell(int targetR, int targetC)
     {
         bool anyMoved = false;
         int safety = 0;
 
-        while ((MazeData.PlayerPos.r != targetR || MazeData.PlayerPos.c != targetC) && safety++ < 32)
+        while ((MazeData.PlayerPos.r != targetR || MazeData.PlayerPos.c != targetC) && safety++ < maxTeleportCellsPerJump)
         {
             int dr = Mathf.Clamp(targetR - MazeData.PlayerPos.r, -1, 1);
             int dc = Mathf.Clamp(targetC - MazeData.PlayerPos.c, -1, 1);
 
             bool stepped = false;
-            // Try cardinal directions toward target
             if (dr != 0 && MazeData.TryStepToAdjacentCell(MazeData.PlayerPos.r + dr, MazeData.PlayerPos.c))
             {
                 stepped = true;
@@ -274,8 +549,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 break; // Hit a wall! Stop advancing.
         }
 
-        // ANTI-CHEAT SNAPBACK: If the player's rig teleported into a cell (targetR, targetC)
-        // that could NOT be reached legally through open corridors, snap the XR Rig back to PlayerPos!
+        // ANTI-CHEAT / MAX-DISTANCE CLAMP: If the XR Rig moved past a wall or past maxTeleportCellsPerJump,
+        // snap the XR Rig cleanly to the furthest legal cell reached!
         if (MazeData.PlayerPos.r != targetR || MazeData.PlayerPos.c != targetC)
         {
             if (xrRigRoot != null)
@@ -291,12 +566,160 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             UpdateBreadcrumbsAnd2DMap();
     }
 
+    // Properly sets m_InteractionLayers.m_Bits = All Layers on any XRI Interactor or Interactable!
+    static void SetAllInteractionLayersOnComponent(Component comp)
+    {
+        if (comp == null) return;
+        Type t = comp.GetType();
+        while (t != null && t != typeof(MonoBehaviour))
+        {
+            FieldInfo f = t.GetField("m_InteractionLayers", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+            if (f != null)
+            {
+                object maskBoxed = f.GetValue(comp);
+                if (maskBoxed != null)
+                {
+                    FieldInfo bitsField = maskBoxed.GetType().GetField("m_Bits", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                    if (bitsField != null)
+                    {
+                        if (bitsField.FieldType == typeof(uint))
+                            bitsField.SetValue(maskBoxed, uint.MaxValue);
+                        else
+                            bitsField.SetValue(maskBoxed, -1);
+
+                        f.SetValue(comp, maskBoxed); // Write modified struct back into component!
+                    }
+                }
+                break;
+            }
+            t = t.BaseType;
+        }
+    }
+
+    void CacheXRLocomotionAndTeleportComponents()
+    {
+        teleportRayInteractors.Clear();
+
+        foreach (MonoBehaviour mb in xrRigRoot.GetComponentsInChildren<MonoBehaviour>(true))
+        {
+            if (mb == null) continue;
+            Type t = mb.GetType();
+
+            if (t.Name == "TeleportationProvider")
+            {
+                cachedTeleportProvider = mb;
+            }
+            else if (t.Name.Contains("MoveProvider")) // DynamicMoveProvider or ActionBasedContinuousMoveProvider
+            {
+                cachedMoveProvider = mb;
+                moveSpeedProp = t.GetProperty("moveSpeed", BindingFlags.Public | BindingFlags.Instance);
+            }
+            else if (t.Name == "XRRayInteractor")
+            {
+                SetAllInteractionLayersOnComponent(mb);
+
+                string goName = mb.gameObject.name.ToLowerInvariant();
+                if (goName.Contains("teleport"))
+                {
+                    teleportRayInteractors.Add(mb);
+                    if (tryGetHitInfoMethod == null)
+                    {
+                        tryGetHitInfoMethod = t.GetMethod("TryGetHitInfo", new Type[] {
+                            typeof(Vector3).MakeByRefType(),
+                            typeof(Vector3).MakeByRefType(),
+                            typeof(int).MakeByRefType(),
+                            typeof(bool).MakeByRefType()
+                        });
+                    }
+
+                    // Comfortable projectile velocity (12 m/s) so the curve lands naturally on the corridor floor 1 to 6 cells ahead!
+                    var velProp = t.GetProperty("velocity");
+                    velProp?.SetValue(mb, 12f);
+                }
+            }
+        }
+    }
+
+    void ConfigureFloorTeleportationArea(GameObject floor)
+    {
+        if (teleportAreaType == null) return;
+
+        floor.SetActive(false);
+        Component teleArea = floor.AddComponent(teleportAreaType);
+
+        // 1. Add BoxCollider to TeleportationArea.colliders
+        var collidersProp = teleportAreaType.GetProperty("colliders");
+        if (collidersProp != null)
+        {
+            var colList = collidersProp.GetValue(teleArea) as System.Collections.IList;
+            if (colList != null)
+            {
+                colList.Clear();
+                colList.Add(floor.GetComponent<Collider>());
+            }
+        }
+
+        // 2. Link TeleportationProvider
+        if (cachedTeleportProvider != null)
+        {
+            var providerProp = teleportAreaType.GetProperty("teleportationProvider");
+            providerProp?.SetValue(teleArea, cachedTeleportProvider);
+        }
+
+        // 3. Set m_InteractionLayers.m_Bits = -1 (Everything) so Teleport Interactor (Bit 31) turns WHITE/GREEN!
+        SetAllInteractionLayersOnComponent(teleArea);
+
+        floor.SetActive(true);
+    }
+
+    void CreateWallColliderWorld(Transform parent, Vector3 worldPos, Vector3 size)
+    {
+        GameObject colObj = new GameObject("WallCollider");
+        colObj.transform.SetParent(parent, false);
+        colObj.transform.position = new Vector3(worldPos.x, 2.25f, worldPos.z);
+        BoxCollider bc = colObj.AddComponent<BoxCollider>();
+        bc.size = new Vector3(size.x, 4.5f, size.z);
+    }
+
+    void BuildWideCellFloorAndBreadcrumbs(int r, int c)
+    {
+        Vector3 center = CellToWorldCenter(r, c, 0f);
+        GameObject cellObj = new GameObject($"Cell_{r}_{c}");
+        cellObj.transform.SetParent(mazeRoot.transform, false);
+        cellObj.transform.position = center;
+
+        // 1. White Base Floor (with properly configured XR TeleportationArea!)
+        GameObject floor = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        floor.name = "WhiteFloor";
+        floor.transform.SetParent(cellObj.transform, false);
+        floor.transform.localPosition = new Vector3(0f, -0.05f, 0f);
+        Vector3 floorScale = new Vector3(cellSize, 0.1f, cellSize);
+        floor.transform.localScale = floorScale;
+        NormalizeMeshUVsToWorldSpacePosition(floor, PrimitiveType.Cube, center + new Vector3(0f, -0.05f, 0f), floorScale);
+        floor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
+
+        ConfigureFloorTeleportationArea(floor);
+
+        // 2. Inset 3D Black Breadcrumb Overlay
+        float crumbWidth = cellSize * 0.625f;
+        float stubLen = (cellSize - crumbWidth) * 0.5f;
+        float stubOffset = (crumbWidth + stubLen) * 0.5f;
+        float crumbY = 0.008f;
+
+        GameObject[] crumbs = new GameObject[5];
+        crumbs[4] = CreateCrumbPiece(cellObj.transform, "Crumb_Center", center, Vector3.up * crumbY, new Vector3(crumbWidth, 0.015f, crumbWidth));
+        crumbs[AmazingMazeData.DIR_LEFT]  = CreateCrumbPiece(cellObj.transform, "Crumb_W", center, new Vector3(-stubOffset, crumbY, 0f), new Vector3(stubLen, 0.015f, crumbWidth));
+        crumbs[AmazingMazeData.DIR_DOWN]  = CreateCrumbPiece(cellObj.transform, "Crumb_S", center, new Vector3(0f, crumbY, -stubOffset), new Vector3(crumbWidth, 0.015f, stubLen));
+        crumbs[AmazingMazeData.DIR_RIGHT] = CreateCrumbPiece(cellObj.transform, "Crumb_E", center, new Vector3(stubOffset, crumbY, 0f),  new Vector3(stubLen, 0.015f, crumbWidth));
+        crumbs[AmazingMazeData.DIR_UP]    = CreateCrumbPiece(cellObj.transform, "Crumb_N", center, new Vector3(0f, crumbY, stubOffset),  new Vector3(crumbWidth, 0.015f, stubLen));
+
+        breadcrumbMeshes[(r, c)] = crumbs;
+    }
+
     void SetupVRRigAndWristMap()
     {
-        // 1. Force-enable all InputActions & InputActionAssets on the XR Rig so head & hand tracking ALWAYS work!
         ForceEnableAllXRInputActions(xrRigRoot.gameObject);
 
-        // 2. Place XR Origin at StartPos and face down the open corridor
         xrRigRoot.position = CellToWorldCenter(MazeData.StartPos.r, MazeData.StartPos.c, 0.02f);
 
         byte startMask = MazeData.GetSquare(MazeData.StartPos.r, MazeData.StartPos.c, MazeData.StartPos.layer);
@@ -306,18 +729,15 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         else if ((startMask & (1 << AmazingMazeData.DIR_LEFT)) != 0) startYaw = -90f;
         xrRigRoot.eulerAngles = new Vector3(0f, startYaw, 0f);
 
-        // 3. Ensure Camera Offset is at standing height if Floor/Device tracking mode hasn't offset it yet
         Transform camOffset = xrRigRoot.Find("Camera Offset");
         if (camOffset != null && camOffset.localPosition.y < 0.1f)
         {
             camOffset.localPosition = new Vector3(0f, 1.36f, 0f);
         }
 
-        // Track the VR Main Camera (HMD) for accurate head position & gaze direction on the 2D map
         Camera vrCam = xrRigRoot.GetComponentInChildren<Camera>();
         activePlayerHeadOrBody = (vrCam != null) ? vrCam.transform : xrRigRoot;
 
-        // 4. Find Left Controller if not manually assigned
         if (leftWristTransform == null)
         {
             foreach (Transform t in xrRigRoot.GetComponentsInChildren<Transform>(true))
@@ -331,13 +751,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             }
         }
 
-        // 5. Clean up thick white LineRenderers on controllers (which caused the white triangles!)
         foreach (LineRenderer lr in xrRigRoot.GetComponentsInChildren<LineRenderer>(true))
         {
-            lr.widthMultiplier = 0.004f; // Thin, subtle ray instead of a giant white wedge
+            lr.widthMultiplier = 0.004f;
         }
 
-        // 6. Build the 3D Macintosh Wrist Map Tablet on the Left Controller
         if (leftWristTransform != null)
         {
             Build3DWristMapTablet(leftWristTransform);
@@ -348,23 +766,19 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
     }
 
-    // Automatically enables XRI InputActionAssets and TrackedPoseDrivers even if InputActionManager is missing from the scene!
     void ForceEnableAllXRInputActions(GameObject rigRoot)
     {
-        // Enable any InputActionManager in the scene first
         foreach (MonoBehaviour mb in FindObjectsOfType<MonoBehaviour>(true))
         {
             if (mb == null) continue;
             Type t = mb.GetType();
             if (t.Name == "InputActionManager")
             {
-                var enableMethod = t.GetMethod("EnableInput", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                var enableMethod = t.GetMethod("EnableInput", BindingFlags.Public | BindingFlags.Instance);
                 enableMethod?.Invoke(mb, null);
             }
 
-            // Also walk every component on the XR Rig (TrackedPoseDriver, ActionBasedController, etc.)
-            // and call .Enable() on any UnityEngine.InputSystem.InputActionProperty or InputActionAsset
-            foreach (var field in t.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
+            foreach (var field in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
             {
                 if (field.FieldType.Name == "InputActionProperty")
                 {
@@ -400,7 +814,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         float w = wristMapWidthMeters;
         float h = w * aspect;
 
-        // Black Macintosh Window Border Frame
         GameObject bezel = GameObject.CreatePrimitive(PrimitiveType.Cube);
         bezel.name = "MacWindowBezel";
         Destroy(bezel.GetComponent<Collider>());
@@ -409,7 +822,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         bezel.transform.localScale = new Vector3(w + 0.01f, h + 0.01f, 0.005f);
         bezel.GetComponent<Renderer>().sharedMaterial = blackEdgeMaterial;
 
-        // Crisp Unlit 2D Map Screen Quad
         GameObject screen = GameObject.CreatePrimitive(PrimitiveType.Quad);
         screen.name = "MacMapScreen";
         Destroy(screen.GetComponent<Collider>());
@@ -435,6 +847,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             ApplyDitherPropertiesToMaterial(whiteFloorMaterial, new Color(0.95f, 0.95f, 0.95f), lightExposure, lightOffset);
             ApplyDitherPropertiesToMaterial(blackBreadcrumbMaterial, new Color(0.08f, 0.08f, 0.08f), 0.5f, -0.2f);
             ConfigureCameraAndGlobalDither();
+            ApplyMoveSpeedToXR();
 
             if (wristMapObject != null)
             {
@@ -905,22 +1318,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
     }
 
-    void CreateWallColliderWorld(Transform parent, Vector3 worldPos, Vector3 size)
-    {
-        GameObject colObj = new GameObject("WallCollider");
-        colObj.transform.SetParent(parent, false);
-        // Raise invisible wall collider height to 4.5m so teleport arcs can NEVER lob over low 0.85m walls!
-        colObj.transform.position = new Vector3(worldPos.x, 2.25f, worldPos.z);
-        BoxCollider bc = colObj.AddComponent<BoxCollider>();
-        bc.size = new Vector3(size.x, 4.5f, size.z);
-    }
-
     void BuildUnoccupiedCheckerboardCell(int r, int c)
     {
         Vector3 center = CellToWorldCenter(r, c, 0f);
         GameObject chkObj = GameObject.CreatePrimitive(PrimitiveType.Cube);
         chkObj.name = $"CheckerBlock_{r}_{c}";
-        // No TeleportationArea on Checkerboard blocks so player cannot teleport out of bounds!
         Destroy(chkObj.GetComponent<Collider>());
         chkObj.transform.SetParent(mazeRoot.transform, false);
 
@@ -932,41 +1334,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         NormalizeMeshUVsToWorldSpacePosition(chkObj, PrimitiveType.Cube, worldCenter, scale, checkerSquaresPerMeter * 0.5f);
         chkObj.GetComponent<Renderer>().sharedMaterial = checkerboardMaterial;
-    }
-
-    void BuildWideCellFloorAndBreadcrumbs(int r, int c)
-    {
-        Vector3 center = CellToWorldCenter(r, c, 0f);
-        GameObject cellObj = new GameObject($"Cell_{r}_{c}");
-        cellObj.transform.SetParent(mazeRoot.transform, false);
-        cellObj.transform.position = center;
-
-        // 1. White Base Floor (with properly configured XR TeleportationArea!)
-        GameObject floor = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        floor.name = "WhiteFloor";
-        floor.transform.SetParent(cellObj.transform, false);
-        floor.transform.localPosition = new Vector3(0f, -0.05f, 0f);
-        Vector3 floorScale = new Vector3(cellSize, 0.1f, cellSize);
-        floor.transform.localScale = floorScale;
-        NormalizeMeshUVsToWorldSpacePosition(floor, PrimitiveType.Cube, center + new Vector3(0f, -0.05f, 0f), floorScale);
-        floor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
-
-        ConfigureFloorTeleportationArea(floor);
-
-        // 2. Inset 3D Black Breadcrumb Overlay
-        float crumbWidth = cellSize * 0.625f;
-        float stubLen = (cellSize - crumbWidth) * 0.5f;
-        float stubOffset = (crumbWidth + stubLen) * 0.5f;
-        float crumbY = 0.008f;
-
-        GameObject[] crumbs = new GameObject[5];
-        crumbs[4] = CreateCrumbPiece(cellObj.transform, "Crumb_Center", center, Vector3.up * crumbY, new Vector3(crumbWidth, 0.015f, crumbWidth));
-        crumbs[AmazingMazeData.DIR_LEFT] = CreateCrumbPiece(cellObj.transform, "Crumb_W", center, new Vector3(-stubOffset, crumbY, 0f), new Vector3(stubLen, 0.015f, crumbWidth));
-        crumbs[AmazingMazeData.DIR_DOWN] = CreateCrumbPiece(cellObj.transform, "Crumb_S", center, new Vector3(0f, crumbY, -stubOffset), new Vector3(crumbWidth, 0.015f, stubLen));
-        crumbs[AmazingMazeData.DIR_RIGHT] = CreateCrumbPiece(cellObj.transform, "Crumb_E", center, new Vector3(stubOffset, crumbY, 0f), new Vector3(stubLen, 0.015f, crumbWidth));
-        crumbs[AmazingMazeData.DIR_UP] = CreateCrumbPiece(cellObj.transform, "Crumb_N", center, new Vector3(0f, crumbY, stubOffset), new Vector3(crumbWidth, 0.015f, stubLen));
-
-        breadcrumbMeshes[(r, c)] = crumbs;
     }
 
     void BuildCycladicCellWalls(int r, int c, int openMask)
@@ -1458,6 +1825,19 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             }
         }
 
+        // Draw 1-bit [RUN] badge in the top-right corner of the 2D Map when Run Mode is active!
+        if (isRunMode && fbWidth > 36 && fbHeight > 12)
+        {
+            for (int by = 1; by <= 7; by++)
+            {
+                for (int bx = fbWidth - 25; bx <= fbWidth - 2; bx++)
+                {
+                    bool border = (by == 1 || by == 7 || bx == fbWidth - 25 || bx == fbWidth - 2);
+                    fbColors[(fbHeight - 1 - by) * fbWidth + bx] = border ? white : black;
+                }
+            }
+        }
+
         mac2DMapTex.SetPixels32(fbColors);
         mac2DMapTex.Apply();
     }
@@ -1552,9 +1932,10 @@ public class SimpleDesktopMazeWalker : MonoBehaviour
             if (camTransform != null) camTransform.localEulerAngles = new Vector3(pitch, 0f, 0f);
         }
 
+        float speed = builder.isRunMode ? builder.runSpeed : builder.walkSpeed;
         float h = Input.GetAxisRaw("Horizontal");
         float v = Input.GetAxisRaw("Vertical");
-        Vector3 move = (transform.right * h + transform.forward * v).normalized * 4.5f;
+        Vector3 move = (transform.right * h + transform.forward * v).normalized * speed;
         cc.SimpleMove(move);
 #endif
     }
