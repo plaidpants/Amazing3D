@@ -401,13 +401,23 @@ public class AmazingMazeData
         int otherPlaneBase = (baseL == LAYER_WIDE_BASE) ? LAYER_NARROW_BASE : LAYER_WIDE_BASE;
 
         int exitSubLayer = 0;
-        if (MemberOf(dir, r, c, layer)) exitSubLayer = layer;
-        else if (IsRamp(r, c) && MemberOf(dir, r, c, otherPlaneBase)) exitSubLayer = otherPlaneBase;
-        else return null;
+        if (MemberOf(dir, r, c, layer))
+            exitSubLayer = layer;
+        else if (IsRamp(r, c) && MemberOf(dir, r, c, otherPlaneBase))
+            exitSubLayer = otherPlaneBase;
+        else
+            return null;
 
         int exitPlaneBase = BaseLayerOfPlane(exitSubLayer);
         int exitPlaneBridge = BridgeLayerOfPlane(exitSubLayer);
 
+        // If moving along a bridge (or entering a bridge), check if the next cell continues the bridge on exitPlaneBridge first!
+        if (!IsRamp(nr, nc) && MemberOf(oppDir, nr, nc, exitPlaneBridge))
+        {
+            return new StepInfo { r = nr, c = nc, layer = exitPlaneBridge, entryLayer = exitPlaneBridge };
+        }
+
+        // Otherwise check if the next cell connects on the plane's Base layer (1 or 3)
         if (MemberOf(oppDir, nr, nc, exitPlaneBase))
         {
             int landedLayer = exitPlaneBase;
@@ -418,11 +428,6 @@ public class AmazingMazeData
                     landedLayer = rampTargetBase;
             }
             return new StepInfo { r = nr, c = nc, layer = landedLayer, entryLayer = exitPlaneBase };
-        }
-
-        if (!IsRamp(nr, nc) && MemberOf(oppDir, nr, nc, exitPlaneBridge))
-        {
-            return new StepInfo { r = nr, c = nc, layer = exitPlaneBridge, entryLayer = exitPlaneBridge };
         }
 
         return null;

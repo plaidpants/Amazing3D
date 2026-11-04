@@ -10,8 +10,10 @@ Shader "Dither 3D/Opaque"
 {
     Properties
     {
-        _Color ("Color", Color) = (1,1,1,1)
-        _MainTex ("Albedo", 2D) = "white" {}
+        _StencilRef("Stencil Ref", Int) = 0
+        _StencilComp("Stencil Comparison", Int) = 8
+        _Color("Color", Color) = (1,1,1,1)
+        _MainTex("Albedo", 2D) = "white" {}
         _BumpMap ("Normal Map", 2D) = "bump" {}
         _EmissionMap ("Emission", 2D) = "white" {}
 		_EmissionColor ("Emission Color", Color) = (0,0,0,0)
@@ -36,6 +38,12 @@ Shader "Dither 3D/Opaque"
         Tags { "RenderType"="Opaque" }
         LOD 200
 
+        Stencil
+        {
+            Ref[_StencilRef]
+            Comp[_StencilComp]
+        }
+        
         CGPROGRAM
         // Physically based Standard lighting model, and enable shadows on all light types
         #pragma surface surf Standard fullforwardshadows vertex:vert finalcolor:mycolor
