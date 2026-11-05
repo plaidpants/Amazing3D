@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
@@ -156,6 +157,220 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     // Joystick Hat Click (Run Mode) debounce
     private bool hatClickWasPressed = false;
+    private bool rightTriggerWasPressed = false;
+
+    // Right-hand Ray Interactor for pointing at the Left Wrist Map Tablet buttons
+    private List<MonoBehaviour> rightInteractionRays = new List<MonoBehaviour>();
+    private int hoveredWristButtonIndex = -1; // -1 = none, 0..3 = Radio L1..L4, 4 = New Game, 5 = Solution
+
+    // Timer, Statistics, Solution Preview, Ambient Wind & Fireworks
+    private const int TOP_BAR_HEIGHT = 36;
+    private const int BOT_BAR_HEIGHT = 44;
+    private int mazeOffsetX = MARGIN_X;
+    private int mazeOffsetY = TOP_BAR_HEIGHT + MARGIN_Y;
+    private int pendingSkillLevel = 2;
+
+    private float currentMazeElapsedSeconds = 0f;
+    private int lastDisplayedTimerInt = -1;
+    private bool mazeSolvedState = false;
+    private int[] levelSolveCounts = new int[4];
+    private float[] levelBestTimes = new float[4];
+
+    private bool isShowingSolution = false;
+    private float solutionTimerRemaining = 0f;
+    private List<AmazingMazeData.NodePos> activeSolutionNodes = new List<AmazingMazeData.NodePos>();
+
+    private AudioSource windAudioSource;
+    private AudioSource fanfareAudioSource;
+    private AudioSource sfxAudioSource;
+    private AudioClip windLoopClip;
+    private AudioClip clickBlipClip;
+    private AudioClip victoryFanfareClip;
+    private AudioClip fireworkPopClip;
+    private GameObject activeFireworksRoot;
+    private Coroutine activeFireworksCoroutine;
+
+    // Authentic 1984 Macintosh Chicago 12pt Proportional Bitmap Font (9 cap rows + 3 descender rows = 12 rows)
+    private struct ChicagoGlyph
+    {
+        public int width;
+        public string[] rows;
+        public ChicagoGlyph(int w, params string[] r) { width = w; rows = r; }
+    }
+
+    private static readonly Dictionary<char, ChicagoGlyph> CHICAGO_FONT = new Dictionary<char, ChicagoGlyph>()
+    {
+        { ' ', new ChicagoGlyph(4, "....","....","....","....","....","....","....","....","....","....","....","....") },
+        { ':', new ChicagoGlyph(2, "..","..","##","##","..","..","##","##","..","..","..","..") },
+        { '.', new ChicagoGlyph(2, "..","..","..","..","..","..","..","##","##","..","..","..") },
+        { '-', new ChicagoGlyph(5, ".....",".....",".....",".....","#####",".....",".....",".....",".....",".....",".....",".....") },
+        { '!', new ChicagoGlyph(2, "##","##","##","##","##","##","..","##","##","..","..","..") },
+        { '0', new ChicagoGlyph(6, ".####.","##..##","##.###","######","######","###.##","##..##","##..##",".####.","......","......","......") },
+        { '1', new ChicagoGlyph(4, ".##.","###.",".##.",".##.",".##.",".##.",".##.",".##.","####","....","....","....") },
+        { '2', new ChicagoGlyph(6, ".####.","##..##","....##","...##.","..##..",".##...","##....","##..##","######","......","......","......") },
+        { '3', new ChicagoGlyph(6, ".####.","##..##","....##","..###.","....##","....##","....##","##..##",".####.","......","......","......") },
+        { '4', new ChicagoGlyph(7, "...###.","..####.",".##.##.","##..##.","##..##.","#######","....##.","....##.","....##.",".......",".......",".......") },
+        { '5', new ChicagoGlyph(6, "######","##....","##....","#####.","....##","....##","....##","##..##",".####.","......","......","......") },
+        { '6', new ChicagoGlyph(6, ".####.","##..##","##....","#####.","##..##","##..##","##..##","##..##",".####.","......","......","......") },
+        { '7', new ChicagoGlyph(6, "######","##..##","....##","...##.","..##..","..##..",".##...",".##...",".##...","......","......","......") },
+        { '8', new ChicagoGlyph(6, ".####.","##..##","##..##",".####.","##..##","##..##","##..##","##..##",".####.","......","......","......") },
+        { '9', new ChicagoGlyph(6, ".####.","##..##","##..##","##..##",".#####","....##","....##","##..##",".####.","......","......","......") },
+        { 'A', new ChicagoGlyph(6, ".####.","##..##","##..##","##..##","######","##..##","##..##","##..##","##..##","......","......","......") },
+        { 'B', new ChicagoGlyph(6, "#####.","##..##","##..##","#####.","##..##","##..##","##..##","##..##","#####.","......","......","......") },
+        { 'C', new ChicagoGlyph(6, ".####.","##..##","##....","##....","##....","##....","##....","##..##",".####.","......","......","......") },
+        { 'D', new ChicagoGlyph(6, "#####.","##..##","##..##","##..##","##..##","##..##","##..##","##..##","#####.","......","......","......") },
+        { 'E', new ChicagoGlyph(6, "######","##....","##....","##....","####..","##....","##....","##....","######","......","......","......") },
+        { 'F', new ChicagoGlyph(6, "######","##....","##....","##....","####..","##....","##....","##....","##....","......","......","......") },
+        { 'G', new ChicagoGlyph(6, ".####.","##..##","##....","##....","##.###","##..##","##..##","##..##",".#####","......","......","......") },
+        { 'H', new ChicagoGlyph(6, "##..##","##..##","##..##","##..##","######","##..##","##..##","##..##","##..##","......","......","......") },
+        { 'I', new ChicagoGlyph(4, "####",".##.",".##.",".##.",".##.",".##.",".##.",".##.","####","....","....","....") },
+        { 'L', new ChicagoGlyph(6, "##....","##....","##....","##....","##....","##....","##....","##....","######","......","......","......") },
+        { 'M', new ChicagoGlyph(8, "##....##","###..###","########","########","##.##.##","##....##","##....##","##....##","##....##","........","........","........") },
+        { 'N', new ChicagoGlyph(6, "##..##","###.##","######","######","##.###","##..##","##..##","##..##","##..##","......","......","......") },
+        { 'O', new ChicagoGlyph(6, ".####.","##..##","##..##","##..##","##..##","##..##","##..##","##..##",".####.","......","......","......") },
+        { 'P', new ChicagoGlyph(6, "#####.","##..##","##..##","##..##","#####.","##....","##....","##....","##....","......","......","......") },
+        { 'R', new ChicagoGlyph(6, "#####.","##..##","##..##","##..##","#####.","##.##.","##..##","##..##","##..##","......","......","......") },
+        { 'S', new ChicagoGlyph(6, ".####.","##..##","##....",".###..","...##.","....##","....##","##..##",".####.","......","......","......") },
+        { 'T', new ChicagoGlyph(6, "######","..##..","..##..","..##..","..##..","..##..","..##..","..##..","..##..","......","......","......") },
+        { 'U', new ChicagoGlyph(6, "##..##","##..##","##..##","##..##","##..##","##..##","##..##","##..##",".####.","......","......","......") },
+        { 'V', new ChicagoGlyph(6, "##..##","##..##","##..##","##..##","##..##",".##.#.",".##.#.","..##..","..##..","......","......","......") },
+        { 'W', new ChicagoGlyph(8, "##....##","##....##","##....##","##....##","##.##.##","########","########","###..###","##....##","........","........","........") },
+        { 'Y', new ChicagoGlyph(6, "##..##","##..##","##..##",".##.#.","..##..","..##..","..##..","..##..","..##..","......","......","......") },
+        { 'a', new ChicagoGlyph(6, "......","......",".####.","....##",".#####","##..##","##..##","##..##",".#####","......","......","......") },
+        { 'b', new ChicagoGlyph(6, "##....","##....","#####.","##..##","##..##","##..##","##..##","##..##","#####.","......","......","......") },
+        { 'c', new ChicagoGlyph(6, "......","......",".####.","##..##","##....","##....","##....","##..##",".####.","......","......","......") },
+        { 'd', new ChicagoGlyph(6, "....##","....##",".#####","##..##","##..##","##..##","##..##","##..##",".#####","......","......","......") },
+        { 'e', new ChicagoGlyph(6, "......","......",".####.","##..##","######","##....","##....","##..##",".####.","......","......","......") },
+        { 'f', new ChicagoGlyph(5, "..##.",".##.#",".##..","####.",".##..",".##..",".##..",".##..",".##..",".....",".....",".....") },
+        { 'g', new ChicagoGlyph(6, "......","......",".#####","##..##","##..##","##..##","##..##",".#####","....##","....##","##..##",".####.") },
+        { 'h', new ChicagoGlyph(6, "##....","##....","#####.","##..##","##..##","##..##","##..##","##..##","##..##","......","......","......") },
+        { 'i', new ChicagoGlyph(2, "##","..","##","##","##","##","##","##","##","..","..","..") },
+        { 'l', new ChicagoGlyph(2, "##","##","##","##","##","##","##","##","##","..","..","..") },
+        { 'm', new ChicagoGlyph(8, "........","........","###.###.","########","##.##.##","##.##.##","##.##.##","##.##.##","##.##.##","........","........","........") },
+        { 'n', new ChicagoGlyph(6, "......","......","#####.","##..##","##..##","##..##","##..##","##..##","##..##","......","......","......") },
+        { 'o', new ChicagoGlyph(6, "......","......",".####.","##..##","##..##","##..##","##..##","##..##",".####.","......","......","......") },
+        { 'p', new ChicagoGlyph(6, "......","......","#####.","##..##","##..##","##..##","##..##","#####.","##....","##....","##....","......") },
+        { 'r', new ChicagoGlyph(5, ".....",".....","##.##","###..","##...","##...","##...","##...","##...",".....",".....",".....") },
+        { 's', new ChicagoGlyph(6, "......","......",".####.","##..##",".###..","...##.","....##","##..##",".####.","......","......","......") },
+        { 't', new ChicagoGlyph(4, ".##.",".##.","####",".##.",".##.",".##.",".##.",".##.","..##","....","....","....") },
+        { 'u', new ChicagoGlyph(6, "......","......","##..##","##..##","##..##","##..##","##..##","##..##",".#####","......","......","......") },
+        { 'v', new ChicagoGlyph(6, "......","......","##..##","##..##","##..##","##..##",".##.#.","..##..","..##..","......","......","......") },
+        { 'w', new ChicagoGlyph(8, "........","........","##....##","##....##","##.##.##","##.##.##","########","###..###","##....##","........","........","........") },
+        { 'y', new ChicagoGlyph(6, "......","......","##..##","##..##","##..##","##..##","##..##",".#####","....##","....##","##..##",".####.") }
+    };
+
+    // Exact 1984 Macintosh Victory Penguin playing Bugle with Musical Notes (87x108 native 1-bit PICT)
+    private static readonly string[] PENGUIN_SPRITE_87X112 = new string[]
+    {
+        "      #######                                                                          ",
+        "    ##.......##                                                                        ",
+        "   #..........##                                                                       ",
+        "  #.............#                                                                      ",
+        " #..............##                                                                     ",
+        "##.....######....#.    #############################################                   ",
+        "#..........##....########################################################              ",
+        "#................###########################################################           ",
+        "#.................####.#.###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.########          ",
+        "#.................###.#.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.######         ",
+        "#.................##.#.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####       ",
+        "#...###...###.....###.####.##.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####       ",
+        "#...###.#.###.....########.###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####      ",
+        "#.....#.....#......######.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###.     ",
+        "##...............########.##.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###.    ",
+        " #.............#############..#######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####    ",
+        "  #............###.###..###....#######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####    ",
+        "  ##..........###.####..###.....#########.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####   ",
+        "    ##.......###.#.##..############...######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###   ",
+        "     ##########.#.####################..#######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####   ",
+        "       #####.#.#.#.#####.#.#####.#################.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###   ",
+        "       ##.#.#.#.#.#.#.#.#.##.##.#.#.#.###################.#.#.#.#.#.#.#.#.#.#.#.#.##   ",
+        "      ####.#.#.#.#.#.#.#.#.#####.#.#.#.#######################.#.#.#.#.#.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.###############.#.#.##.##############.#.#.#.#.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.###############.#.#.##...############.#.#.#.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#############.#.#.#.###..#####.######.#.#.#.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#######.#.#.#.#.#.#################.#.#.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#####.#.#.#.#.#.###############.#.#.#.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#######.#.#.#.#.#################.#.#.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#######.#.#.#.#.###############.#.#.#.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#######.#.#.#.#.###############.#.#.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.#.#.#.##########.######.#.#.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.#.#.#################.#.#.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.#.#.######.##########.#.#.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.#.#######.###########.#.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.######...############.#.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##############....###########.#.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.############.....############.#.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###########.....#############.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###########......############.#.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.......#############.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#######........##############.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####.........#############.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####..........#############.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...........############.#.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...........#############.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...........##############.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###............##############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####.............############.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##..............#############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............###########.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............#############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............#############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............#############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............##############.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............#############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............#############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###..............############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............###########.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............###########.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................##########.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................###########.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.................#########.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................##########.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................#########.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.................#########.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................########.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................#########.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................##########.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................#########.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................#########.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###.................#######.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##.................########.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##.................######.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###..................######.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###..................####.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##..................#####.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##.................####.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###.................###.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###.##.............####.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##..#............####.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##..#...........#####.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...##.........####.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...###...#######.#.#.#.####  ",
+        "       ##.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####...#...######.#.#.#.####   ",
+        "       ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#################.#.#.#.###   ",
+        "       ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###########.#####.#.#.####   ",
+        "       ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#######.#.#.#######.#.#####   ",
+        "       ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####.#.#.#######.#.#.####   ",
+        "        ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####.#.#.#########.#.####    ",
+        "        #####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#######.#.#########.#.#####    ",
+        "        ######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.#.#######.#.#.######    ",
+        "         ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###########.#.#####.#.#.######     ",
+        "          ######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#############.#####.#.#.######      ",
+        "           ######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#############.#.#.#.#.#.######       ",
+        "           #######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####.#       ",
+        "             ######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#######.         ",
+        "              ##########.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.          ",
+        "               #############################################################           ",
+        "                  #######################################################              ",
+        "                       #############################################                   "
+    };
 
     private static readonly byte[] CIRCLE_ROWS = new byte[]
     {
@@ -179,9 +394,12 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
 
         EnsureDither3DMaterials();
+        LoadPersistentStats();
+        pendingSkillLevel = Mathf.Clamp(skillLevel, 0, 3);
         MazeData = new AmazingMazeData();
         MazeData.MakeMaze(skillLevel);
         lastBuiltSkillLevel = skillLevel;
+        ResetMazeTimerAndSolution();
 
         if (xrRigRoot != null)
             CacheXRLocomotionAndTeleportComponents();
@@ -192,6 +410,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             SetupVRRigAndWristMap();
         else
             SpawnSimpleDesktopPlayer();
+
+        // Initialize procedural audio AFTER the player camera / AudioListener is active
+        EnsureProceduralAudioAndWind();
 
         IgnoreStairFloorCollisionsForPlayer();
         ApplyMoveSpeedToXR();
@@ -251,14 +472,52 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         {
             ToggleRunMode();
         }
-        if (Input.GetKeyDown(KeyCode.Alpha1)) SwitchToSkillLevel(0);
-        if (Input.GetKeyDown(KeyCode.Alpha2)) SwitchToSkillLevel(1);
-        if (Input.GetKeyDown(KeyCode.Alpha3)) SwitchToSkillLevel(2);
-        if (Input.GetKeyDown(KeyCode.Alpha4)) SwitchToSkillLevel(3);
+        if (Input.GetKeyDown(KeyCode.Alpha1)) SelectPendingSkillLevel(0);
+        if (Input.GetKeyDown(KeyCode.Alpha2)) SelectPendingSkillLevel(1);
+        if (Input.GetKeyDown(KeyCode.Alpha3)) SelectPendingSkillLevel(2);
+        if (Input.GetKeyDown(KeyCode.Alpha4)) SelectPendingSkillLevel(3);
+        if (Input.GetKeyDown(KeyCode.N)) StartNewMazeWithPendingSkill();
+        if (Input.GetKeyDown(KeyCode.H)) ToggleSolutionDisplay();
 #endif
         if (activePlayerHeadOrBody == null) return;
 
+        bool needRedraw2D = false;
+
+        if (!mazeSolvedState)
+        {
+            currentMazeElapsedSeconds += Time.deltaTime;
+            int secInt = Mathf.FloorToInt(currentMazeElapsedSeconds);
+            if (secInt != lastDisplayedTimerInt)
+            {
+                lastDisplayedTimerInt = secInt;
+                needRedraw2D = true;
+            }
+        }
+
+        if (isShowingSolution)
+        {
+            solutionTimerRemaining -= Time.deltaTime;
+            if (solutionTimerRemaining <= 0f)
+            {
+                isShowingSolution = false;
+                activeSolutionNodes.Clear();
+                needRedraw2D = true;
+            }
+        }
+
+        // Modulate ambient wind subtly with player height and auto-resume if XR session paused it at startup
+        if (windAudioSource != null)
+        {
+            if (!windAudioSource.isPlaying && windAudioSource.clip != null)
+                windAudioSource.Play();
+
+            float heightFactor = Mathf.Clamp01(activePlayerHeadOrBody.position.y / Mathf.Max(1f, upperFloorY));
+            windAudioSource.volume = Mathf.Lerp(0.32f, 0.50f, heightFactor);
+            windAudioSource.pitch = Mathf.Lerp(0.95f, 1.12f, heightFactor);
+        }
+
         PollJoystickHatRunToggleSafe();
+        MonitorWristMapUIInteraction(ref needRedraw2D);
 
         if (xrRigRoot != null)
         {
@@ -288,6 +547,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         UpdateBridgeRenderQueuesFrontToBack();
 
+        if (needRedraw2D)
+        {
+            RenderEntireMaze2D();
+        }
+
         float curYaw = activePlayerHeadOrBody.eulerAngles.y;
         if ((curPos - lastPlayerPos).sqrMagnitude > 0.0001f || Mathf.Abs(Mathf.DeltaAngle(curYaw, lastPlayerYaw)) > 0.25f)
         {
@@ -297,12 +561,80 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
     }
 
+    public void SelectPendingSkillLevel(int newPendingLevel)
+    {
+        pendingSkillLevel = Mathf.Clamp(newPendingLevel, 0, 3);
+        PlayClickBlipSound();
+        RenderEntireMaze2D();
+    }
+
+    public void StartNewMazeWithPendingSkill()
+    {
+        SwitchToSkillLevel(pendingSkillLevel);
+    }
+
+    public void GenerateNewMazeSameSkill()
+    {
+        SwitchToSkillLevel(pendingSkillLevel);
+    }
+
+    public void ToggleSolutionDisplay()
+    {
+        if (isShowingSolution)
+        {
+            isShowingSolution = false;
+            solutionTimerRemaining = 0f;
+            activeSolutionNodes.Clear();
+            PlayClickBlipSound();
+            RenderEntireMaze2D();
+        }
+        else
+        {
+            TriggerTemporarySolutionDisplay(8.0f);
+        }
+    }
+
+    public void TriggerTemporarySolutionDisplay(float durationSeconds = 8.0f)
+    {
+        if (MazeData == null) return;
+        activeSolutionNodes = MazeData.FindShortestPathToEnd();
+        isShowingSolution = activeSolutionNodes.Count > 1;
+        solutionTimerRemaining = durationSeconds;
+        PlayClickBlipSound();
+        RenderEntireMaze2D();
+    }
+
+    void ResetMazeTimerAndSolution()
+    {
+        currentMazeElapsedSeconds = 0f;
+        lastDisplayedTimerInt = 0;
+        mazeSolvedState = false;
+        isShowingSolution = false;
+        solutionTimerRemaining = 0f;
+        activeSolutionNodes.Clear();
+        if (activeFireworksCoroutine != null)
+        {
+            StopCoroutine(activeFireworksCoroutine);
+            activeFireworksCoroutine = null;
+        }
+        if (activeFireworksRoot != null)
+        {
+            Destroy(activeFireworksRoot);
+            activeFireworksRoot = null;
+        }
+    }
+
     public void SwitchToSkillLevel(int newSkillLevel)
     {
         skillLevel = Mathf.Clamp(newSkillLevel, 0, 3);
+        pendingSkillLevel = skillLevel;
         lastBuiltSkillLevel = skillLevel;
+        ResetMazeTimerAndSolution();
+        PlayClickBlipSound();
         MazeData.MakeMaze(skillLevel);
         RebuildMazeGeometryOnly();
+        if (xrRigRoot != null && leftWristTransform != null)
+            Build3DWristMapTablet(leftWristTransform);
         IgnoreStairFloorCollisionsForPlayer();
         RepositionPlayerAtStart();
         UpdateNonEuclideanTunnelState();
@@ -994,7 +1326,13 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
 
         if (anyMoved)
+        {
             UpdateBreadcrumbsAnd2DMap();
+            if (!mazeSolvedState && MazeData.GameWon)
+            {
+                OnMazeSolvedVictory();
+            }
+        }
     }
 
     static void SetAllInteractionLayersOnComponent(Component comp)
@@ -1089,6 +1427,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     void CacheXRLocomotionAndTeleportComponents()
     {
         teleportRayInteractors.Clear();
+        rightInteractionRays.Clear();
         moveProviders.Clear();
         xrCharacterController = xrRigRoot.GetComponentInChildren<CharacterController>(true);
         if (xrCharacterController != null)
@@ -1180,6 +1519,13 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
                     var velProp = t.GetProperty("velocity");
                     velProp?.SetValue(mb, 12f);
+                }
+                else
+                {
+                    if (!IsUnderLeftHandHierarchy(mb.transform))
+                    {
+                        rightInteractionRays.Add(mb);
+                    }
                 }
             }
         }
@@ -1311,6 +1657,26 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         generatedSquareRamp2D.Apply();
     }
 
+    static Shader FindPureUnlitTextureShader()
+    {
+        Shader s = Shader.Find("Custom/MacUnlitTexture");
+        if (s == null) s = Shader.Find("Unlit/Texture");
+        if (s == null) s = Shader.Find("Sprites/Default");
+        if (s == null) s = Shader.Find("UI/Default");
+        if (s == null) s = Shader.Find("Standard");
+        return s;
+    }
+
+    static void ConfigurePureUnlitMaterial(Material mat)
+    {
+        if (mat == null) return;
+        mat.color = Color.white;
+        if (mat.HasProperty("_Glossiness")) mat.SetFloat("_Glossiness", 0f);
+        if (mat.HasProperty("_Metallic")) mat.SetFloat("_Metallic", 0f);
+        if (mat.HasProperty("_SpecularHighlights")) mat.SetFloat("_SpecularHighlights", 0f);
+        if (mat.HasProperty("_GlossyReflections")) mat.SetFloat("_GlossyReflections", 0f);
+    }
+
     void BuildCheckerboardMaterial()
     {
         if (generatedCheckerTex == null)
@@ -1326,10 +1692,13 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         if (checkerboardMaterial == null)
         {
-            Shader unlitTex = Shader.Find("Unlit/Texture");
-            if (unlitTex == null) unlitTex = Shader.Find("Standard");
-            checkerboardMaterial = new Material(unlitTex) { name = "MacCheckerboard_Mat" };
+            checkerboardMaterial = new Material(FindPureUnlitTextureShader()) { name = "MacCheckerboard_Mat" };
         }
+        else
+        {
+            checkerboardMaterial.shader = FindPureUnlitTextureShader();
+        }
+        ConfigurePureUnlitMaterial(checkerboardMaterial);
         checkerboardMaterial.mainTexture = generatedCheckerTex;
     }
 
@@ -1454,11 +1823,14 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             cam.backgroundColor = new Color(0.85f, 0.85f, 0.85f);
         }
 
-        // Disable cast shadows on directional lights so Dither3D uses clean N-dot-L directional shading
-        // without Euclidean shadow-map projection artifacts across non-Euclidean portals
+        // Restore previous scene ambient lighting so maze wall shadows retain their original balanced brightness
+        RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Skybox;
+        RenderSettings.ambientIntensity = 1.0f;
+
         foreach (Light l in FindObjectsOfType<Light>())
         {
             l.shadows = LightShadows.None;
+            l.color = Color.white;
         }
 
         Shader.EnableKeyword("DITHERCOL_GRAYSCALE");
@@ -1559,10 +1931,14 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         bridgeCells.Clear();
         lastBridgeSortLayer = -1;
 
-        InitFramebuffer(
-            MARGIN_X * 2 + MazeData.MaxCol * TILE_STRIDE,
-            MARGIN_Y * 2 + MazeData.MaxRow * TILE_STRIDE
-        );
+        int rawMazeW = MazeData.MaxCol * TILE_STRIDE + 1;
+        int rawMazeH = MazeData.MaxRow * TILE_STRIDE + 1;
+        int canvasW = Mathf.Max(481, rawMazeW + MARGIN_X * 2);
+        int canvasMazeAreaH = Mathf.Max(317, rawMazeH + MARGIN_Y * 2);
+        mazeOffsetX = (canvasW - rawMazeW) / 2;
+        mazeOffsetY = TOP_BAR_HEIGHT + (canvasMazeAreaH - rawMazeH) / 2;
+
+        InitFramebuffer(canvasW, TOP_BAR_HEIGHT + canvasMazeAreaH + BOT_BAR_HEIGHT);
 
         int minR = fillUnoccupiedWithCheckerboard ? 0 : 1;
         int maxR = fillUnoccupiedWithCheckerboard ? MazeData.MaxRow + 1 : MazeData.MaxRow;
@@ -3328,7 +3704,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
         if (endMarkerRenderer != null)
         {
-            bool endOccupied = (MazeData.GetSquare(MazeData.EndPos.r, MazeData.EndPos.c, MazeData.EndPos.layer) & 0x30) != 0;
+            bool endOccupied = MazeData.GameWon || mazeSolvedState ||
+                               (MazeData.GetSquare(MazeData.EndPos.r, MazeData.EndPos.c, MazeData.EndPos.layer) & 0x30) != 0;
             endMarkerRenderer.sharedMaterial = endOccupied ? whiteWallMaterial : blackBreadcrumbMaterial;
         }
 
@@ -3428,7 +3805,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         wristMapObject.transform.localEulerAngles = wristMapLocalEuler;
 
         float aspect = (float)fbHeight / fbWidth;
-        float w = wristMapWidthMeters;
+        float w = Mathf.Max(wristMapWidthMeters, 0.28f);
         float h = w * aspect;
 
         GameObject bezel = GameObject.CreatePrimitive(PrimitiveType.Cube);
@@ -3441,15 +3818,580 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         GameObject screen = GameObject.CreatePrimitive(PrimitiveType.Quad);
         screen.name = "MacMapScreen";
-        Destroy(screen.GetComponent<Collider>());
+        // Keep a thin BoxCollider on the wrist map screen so the Right-hand Ray Interactor can point at and click the Macintosh buttons!
+        Collider existingCol = screen.GetComponent<Collider>();
+        if (existingCol != null) Destroy(existingCol);
+        BoxCollider mapCollider = screen.AddComponent<BoxCollider>();
+        mapCollider.size = new Vector3(1f, 1f, 0.03f);
+
         screen.transform.SetParent(wristMapObject.transform, false);
         screen.transform.localPosition = Vector3.zero;
         screen.transform.localScale = new Vector3(w, h, 1f);
 
-        Shader unlitTex = Shader.Find("Unlit/Texture");
-        if (unlitTex == null) unlitTex = Shader.Find("Standard");
-        wristMapMaterial = new Material(unlitTex) { mainTexture = mac2DMapTex };
+        wristMapMaterial = new Material(FindPureUnlitTextureShader()) { mainTexture = mac2DMapTex };
+        ConfigurePureUnlitMaterial(wristMapMaterial);
         screen.GetComponent<Renderer>().sharedMaterial = wristMapMaterial;
+    }
+
+    /* ============================================================================
+     * PERSISTENT STATS, PROCEDURAL AUDIO (WIND / FANFARE) & FIREWORKS CELEBRATION
+     * ============================================================================ */
+    void LoadPersistentStats()
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            levelSolveCounts[i] = PlayerPrefs.GetInt($"Amazing_Solves_L{i}", 0);
+            levelBestTimes[i]   = PlayerPrefs.GetFloat($"Amazing_BestTime_L{i}", 0f);
+        }
+    }
+
+    void SavePersistentStats(int lvl)
+    {
+        if (lvl < 0 || lvl >= 4) return;
+        PlayerPrefs.SetInt($"Amazing_Solves_L{lvl}", levelSolveCounts[lvl]);
+        PlayerPrefs.SetFloat($"Amazing_BestTime_L{lvl}", levelBestTimes[lvl]);
+        PlayerPrefs.Save();
+    }
+
+    static void NormalizeStereoBuffer(float[] interleavedStereo, int totalFrames, float targetPeak)
+    {
+        float maxAbs = 0.0001f;
+        int len = totalFrames * 2;
+        for (int i = 0; i < len; i++)
+        {
+            float a = Mathf.Abs(interleavedStereo[i]);
+            if (a > maxAbs) maxAbs = a;
+        }
+        float gain = targetPeak / maxAbs;
+        for (int i = 0; i < len; i++)
+        {
+            interleavedStereo[i] = Mathf.Clamp(interleavedStereo[i] * gain, -0.98f, 0.98f);
+        }
+    }
+
+    void EnsureProceduralAudioAndWind()
+    {
+        AudioListener.pause = false;
+        AudioListener.volume = 1.0f;
+
+        Transform audioParent = activePlayerHeadOrBody != null ? activePlayerHeadOrBody : (Camera.main != null ? Camera.main.transform : transform);
+        AudioListener existingListener = FindObjectOfType<AudioListener>();
+        if (existingListener == null && audioParent != null)
+        {
+            existingListener = audioParent.gameObject.AddComponent<AudioListener>();
+        }
+        if (existingListener != null)
+        {
+            existingListener.enabled = true;
+            audioParent = existingListener.transform;
+        }
+
+        int sr = AudioSettings.outputSampleRate > 8000 ? AudioSettings.outputSampleRate : 48000;
+
+        if (windLoopClip == null)
+            windLoopClip = CreateProceduralPineForestWindLoopClip(16.0f, sr);
+        if (clickBlipClip == null)
+            clickBlipClip = CreateProceduralMacBlipClip(sr);
+        if (victoryFanfareClip == null)
+            victoryFanfareClip = CreateProceduralVictoryFanfareClip(sr);
+        if (fireworkPopClip == null)
+            fireworkPopClip = CreateProceduralFireworkPopClip(sr);
+
+        if (windAudioSource == null)
+        {
+            GameObject windObj = new GameObject("AmbientWindAudio");
+            windObj.transform.SetParent(audioParent, false);
+            windObj.transform.localPosition = Vector3.zero;
+            windAudioSource = windObj.AddComponent<AudioSource>();
+            windAudioSource.clip = windLoopClip;
+            windAudioSource.loop = true;
+            windAudioSource.spatialBlend = 0f;
+            windAudioSource.priority = 0;
+            windAudioSource.volume = 0.11f;
+            windAudioSource.playOnAwake = true;
+            windAudioSource.ignoreListenerPause = true;
+            windAudioSource.Play();
+        }
+
+        if (fanfareAudioSource == null)
+        {
+            GameObject fanObj = new GameObject("MazeVictoryFanfareAudio");
+            fanObj.transform.SetParent(audioParent, false);
+            fanObj.transform.localPosition = Vector3.zero;
+            fanfareAudioSource = fanObj.AddComponent<AudioSource>();
+            fanfareAudioSource.clip = victoryFanfareClip;
+            fanfareAudioSource.loop = false;
+            fanfareAudioSource.spatialBlend = 0f;
+            fanfareAudioSource.priority = 0;
+            fanfareAudioSource.volume = 0.95f;
+            fanfareAudioSource.playOnAwake = false;
+            fanfareAudioSource.ignoreListenerPause = true;
+        }
+
+        if (sfxAudioSource == null)
+        {
+            GameObject sfxObj = new GameObject("MazeSFXAudio");
+            sfxObj.transform.SetParent(audioParent, false);
+            sfxObj.transform.localPosition = Vector3.zero;
+            sfxAudioSource = sfxObj.AddComponent<AudioSource>();
+            sfxAudioSource.loop = false;
+            sfxAudioSource.spatialBlend = 0f;
+            sfxAudioSource.priority = 10;
+            sfxAudioSource.volume = 0.90f;
+            sfxAudioSource.playOnAwake = false;
+            sfxAudioSource.ignoreListenerPause = true;
+        }
+    }
+
+    void PlayClickBlipSound()
+    {
+        if (sfxAudioSource != null && clickBlipClip != null)
+            sfxAudioSource.PlayOneShot(clickBlipClip, 0.70f);
+    }
+
+    static AudioClip CreateProceduralPineForestWindLoopClip(float durationSec, int sampleRate)
+    {
+        int totalFrames = Mathf.RoundToInt(durationSec * sampleRate);
+        float[] stereoData = new float[totalFrames * 2];
+        System.Random prng = new System.Random(1984);
+
+        float[] rawL = new float[totalFrames];
+        float[] rawR = new float[totalFrames];
+        for (int i = 0; i < totalFrames; i++)
+        {
+            rawL[i] = (float)(prng.NextDouble() * 2.0 - 1.0);
+            rawR[i] = (float)(prng.NextDouble() * 2.0 - 1.0);
+        }
+
+        // Pine Forest Ambient Sound Generator:
+        // Deep soft Brownian/pink canopy breeze + subtle high-frequency pine needle whisper
+        // Modulated by 5 incommensurate prime-ratio slow cycles for natural, non-repeating organic gusts
+        float lpAirL = 0f, lpAirR = 0f;
+        float lpHalfL = 0f, lpHalfR = 0f;
+        float bpNeedleL = 0f, bpNeedleR = 0f;
+        int warmup = sampleRate * 2; // Warm up filters to guarantee click-free seamless loop
+
+        for (int pass = -warmup; pass < totalFrames; pass++)
+        {
+            int idx = (pass + totalFrames * 4) % totalFrames;
+            float normPhase = idx / (float)totalFrames;
+
+            // 5 co-prime integer LFO cycles over 16 seconds (periods: 16s, 8s, 5.33s, 3.2s, 2.28s)
+            float lfo1L = Mathf.Sin(normPhase * Mathf.PI * 2f * 1f);
+            float lfo2L = Mathf.Sin(normPhase * Mathf.PI * 2f * 2f + 0.9f);
+            float lfo3L = Mathf.Sin(normPhase * Mathf.PI * 2f * 3f + 2.1f);
+            float lfo5L = Mathf.Sin(normPhase * Mathf.PI * 2f * 5f + 1.4f);
+            float lfo7L = Mathf.Sin(normPhase * Mathf.PI * 2f * 7f + 3.8f);
+
+            float lfo1R = Mathf.Sin(normPhase * Mathf.PI * 2f * 1f + 0.45f);
+            float lfo2R = Mathf.Sin(normPhase * Mathf.PI * 2f * 2f + 1.35f);
+            float lfo3R = Mathf.Sin(normPhase * Mathf.PI * 2f * 3f + 2.70f);
+            float lfo5R = Mathf.Sin(normPhase * Mathf.PI * 2f * 5f + 2.10f);
+            float lfo7R = Mathf.Sin(normPhase * Mathf.PI * 2f * 7f + 4.30f);
+
+            // Natural gust envelope: subtle gentle swells followed by serene, peaceful forest lulls
+            float rawGustL = 0.38f + 0.22f * lfo1L + 0.16f * lfo2L + 0.12f * lfo3L + 0.08f * lfo5L + 0.04f * lfo7L;
+            float rawGustR = 0.38f + 0.22f * lfo1R + 0.16f * lfo2R + 0.12f * lfo3R + 0.08f * lfo5R + 0.04f * lfo7R;
+            float gustL = Mathf.Clamp01(rawGustL * rawGustL);
+            float gustR = Mathf.Clamp01(rawGustR * rawGustR);
+
+            // 1. Soft canopy air movement (deep low-pass 90 Hz - 220 Hz)
+            float fAirL = Mathf.Lerp(90f, 220f, gustL);
+            float aAirL = Mathf.Clamp(2f * Mathf.PI * fAirL / sampleRate, 0.002f, 0.10f);
+            lpAirL += aAirL * (rawL[idx] - lpAirL);
+            lpHalfL += aAirL * 0.7f * (lpAirL - lpHalfL);
+
+            float fAirR = Mathf.Lerp(90f, 220f, gustR);
+            float aAirR = Mathf.Clamp(2f * Mathf.PI * fAirR / sampleRate, 0.002f, 0.10f);
+            lpAirR += aAirR * (rawR[idx] - lpAirR);
+            lpHalfR += aAirR * 0.7f * (lpAirR - lpHalfR);
+
+            // 2. Gentle pine needle rustle / whisper (soft high bandpass 1.6 kHz - 3.4 kHz)
+            float aNeedle = Mathf.Clamp(2f * Mathf.PI * 2200f / sampleRate, 0.02f, 0.40f);
+            bpNeedleL += aNeedle * (rawL[idx] - bpNeedleL);
+            bpNeedleR += aNeedle * (rawR[idx] - bpNeedleR);
+            float needleWhisperL = (rawL[idx] - bpNeedleL) * (0.04f + 0.08f * gustL);
+            float needleWhisperR = (rawR[idx] - bpNeedleR) * (0.04f + 0.08f * gustR);
+
+            if (pass >= 0)
+            {
+                float forestSoundL = (lpHalfL * 1.8f + needleWhisperL) * (0.25f + 0.75f * gustL);
+                float forestSoundR = (lpHalfR * 1.8f + needleWhisperR) * (0.25f + 0.75f * gustR);
+                stereoData[idx * 2]     = forestSoundL;
+                stereoData[idx * 2 + 1] = forestSoundR;
+            }
+        }
+
+        NormalizeStereoBuffer(stereoData, totalFrames, 0.42f);
+        AudioClip clip = AudioClip.Create("PineForestWindLoop", totalFrames, 2, sampleRate, false);
+        clip.SetData(stereoData, 0);
+        return clip;
+    }
+
+    static AudioClip CreateProceduralMacBlipClip(int sampleRate)
+    {
+        int totalFrames = Mathf.RoundToInt(0.065f * sampleRate);
+        float[] stereoData = new float[totalFrames * 2];
+        for (int i = 0; i < totalFrames; i++)
+        {
+            float t = i / (float)sampleRate;
+            float env = 1f - (i / (float)totalFrames);
+            float freq = (i < totalFrames / 2) ? 880f : 1318.5f;
+            float wave = (Mathf.Sign(Mathf.Sin(2f * Mathf.PI * freq * t)) * 0.45f + Mathf.Sin(2f * Mathf.PI * freq * t) * 0.55f) * env;
+            stereoData[i * 2] = wave;
+            stereoData[i * 2 + 1] = wave;
+        }
+        NormalizeStereoBuffer(stereoData, totalFrames, 0.85f);
+        AudioClip clip = AudioClip.Create("MacClickBlip", totalFrames, 2, sampleRate, false);
+        clip.SetData(stereoData, 0);
+        return clip;
+    }
+
+    static AudioClip CreateProceduralVictoryFanfareClip(int sampleRate)
+    {
+        // Classic 1984 Macintosh Penguin Bugle Fanfare ("First Call / Charge!"): G4, C5, E5, G5, E5, G5!
+        float[] freqs = { 392.00f, 523.25f, 659.25f, 783.99f, 659.25f, 783.99f };
+        float[] durs  = { 0.14f,   0.14f,   0.14f,   0.28f,   0.14f,   0.65f   };
+        float totalDur = 0f;
+        for (int i = 0; i < durs.Length; i++) totalDur += durs[i];
+
+        int totalFrames = Mathf.RoundToInt(totalDur * sampleRate);
+        float[] stereoData = new float[totalFrames * 2];
+
+        int curFrame = 0;
+        for (int n = 0; n < freqs.Length; n++)
+        {
+            int noteFrames = Mathf.RoundToInt(durs[n] * sampleRate);
+            float f = freqs[n];
+            for (int i = 0; i < noteFrames && (curFrame + i) < totalFrames; i++)
+            {
+                float t = i / (float)sampleRate;
+                float norm = i / (float)noteFrames;
+                float attack = Mathf.Clamp01(i / (0.008f * sampleRate));
+                float decay = (n == freqs.Length - 1) ? Mathf.Pow(1f - norm * 0.85f, 1.2f) : Mathf.Pow(1f - norm * 0.65f, 1.3f);
+                float env = attack * decay;
+
+                // Brassy bugle harmonic series (1st, 2nd, 3rd, 4th harmonics + crisp Macintosh square edge)
+                float brass = Mathf.Sin(2f * Mathf.PI * f * t) * 0.45f
+                            + Mathf.Sin(2f * Mathf.PI * (f * 2f) * t) * 0.30f
+                            + Mathf.Sin(2f * Mathf.PI * (f * 3f) * t) * 0.18f
+                            + Mathf.Sign(Mathf.Sin(2f * Mathf.PI * f * t)) * 0.15f;
+
+                if (n == freqs.Length - 1)
+                {
+                    // Rich major triad chord on the final held bugle note
+                    brass += Mathf.Sin(2f * Mathf.PI * 523.25f * t) * 0.22f
+                           + Mathf.Sin(2f * Mathf.PI * 659.25f * t) * 0.22f;
+                }
+
+                float sample = brass * env;
+                int dst = (curFrame + i) * 2;
+                stereoData[dst] = sample;
+                stereoData[dst + 1] = sample;
+            }
+            curFrame += noteFrames;
+        }
+
+        NormalizeStereoBuffer(stereoData, totalFrames, 0.95f);
+        AudioClip clip = AudioClip.Create("VictoryFanfare1984", totalFrames, 2, sampleRate, false);
+        clip.SetData(stereoData, 0);
+        return clip;
+    }
+
+    static AudioClip CreateProceduralFireworkPopClip(int sampleRate)
+    {
+        int totalFrames = Mathf.RoundToInt(0.38f * sampleRate);
+        float[] stereoData = new float[totalFrames * 2];
+        System.Random prng = new System.Random(42);
+        float bp1 = 0f, bp2 = 0f;
+        for (int i = 0; i < totalFrames; i++)
+        {
+            float t = i / (float)sampleRate;
+            float norm = i / (float)totalFrames;
+            float env = Mathf.Pow(1f - norm, 2.0f);
+            float n = (float)(prng.NextDouble() * 2.0 - 1.0);
+
+            // Mid-range explosion crackle (400 Hz - 2400 Hz) + punchy 280->90 Hz pitch-drop thump
+            bp1 += 0.32f * (n - bp1);
+            bp2 += 0.06f * (bp1 - bp2);
+            float crackle = (bp1 - bp2) * 0.85f;
+            float punch = Mathf.Sin(2f * Mathf.PI * Mathf.Lerp(280f, 85f, Mathf.Sqrt(norm)) * t) * Mathf.Pow(1f - norm, 3.2f) * 0.80f;
+
+            float val = (crackle + punch) * env;
+            stereoData[i * 2] = val;
+            stereoData[i * 2 + 1] = val;
+        }
+        NormalizeStereoBuffer(stereoData, totalFrames, 0.92f);
+        AudioClip clip = AudioClip.Create("FireworkPop", totalFrames, 2, sampleRate, false);
+        clip.SetData(stereoData, 0);
+        return clip;
+    }
+
+    void OnMazeSolvedVictory()
+    {
+        mazeSolvedState = true;
+        int lvl = Mathf.Clamp(skillLevel, 0, 3);
+        levelSolveCounts[lvl]++;
+        if (levelBestTimes[lvl] <= 0.01f || currentMazeElapsedSeconds < levelBestTimes[lvl])
+        {
+            levelBestTimes[lvl] = currentMazeElapsedSeconds;
+        }
+        SavePersistentStats(lvl);
+
+        EnsureProceduralAudioAndWind();
+        if (fanfareAudioSource != null && victoryFanfareClip != null)
+        {
+            fanfareAudioSource.Stop();
+            fanfareAudioSource.clip = victoryFanfareClip;
+            fanfareAudioSource.volume = 0.95f;
+            fanfareAudioSource.Play();
+        }
+        else if (sfxAudioSource != null && victoryFanfareClip != null)
+        {
+            sfxAudioSource.PlayOneShot(victoryFanfareClip, 0.95f);
+        }
+
+        UpdateBreadcrumbsAnd2DMap();
+
+        if (activeFireworksCoroutine != null)
+            StopCoroutine(activeFireworksCoroutine);
+        activeFireworksCoroutine = StartCoroutine(SpawnVictoryFireworksRoutine());
+    }
+
+    IEnumerator SpawnVictoryFireworksRoutine()
+    {
+        if (activeFireworksRoot != null) Destroy(activeFireworksRoot);
+        activeFireworksRoot = new GameObject("VictoryFireworksRoot");
+        if (mazeRoot != null)
+            activeFireworksRoot.transform.SetParent(mazeRoot.transform, false);
+
+        float endFloorY = GetLayerBaseFloorY(MazeData.EndPos.layer);
+        Vector3 goalPos = CellToWorldCenter(MazeData.EndPos.r, MazeData.EndPos.c, endFloorY + 1.8f);
+
+        int numBursts = 6;
+        for (int b = 0; b < numBursts; b++)
+        {
+            if (!mazeSolvedState || activeFireworksRoot == null) yield break;
+
+            Vector3 burstOrigin = goalPos + new Vector3(
+                UnityEngine.Random.Range(-1.6f, 1.6f),
+                UnityEngine.Random.Range(0.5f, 2.2f),
+                UnityEngine.Random.Range(-1.6f, 1.6f)
+            );
+
+            if (sfxAudioSource != null && fireworkPopClip != null)
+                sfxAudioSource.PlayOneShot(fireworkPopClip, 0.85f);
+
+            StartCoroutine(AnimateSingleFireworkBurst(activeFireworksRoot.transform, burstOrigin));
+            yield return new WaitForSeconds(0.55f);
+        }
+    }
+
+    IEnumerator AnimateSingleFireworkBurst(Transform parent, Vector3 burstOrigin)
+    {
+        int sparkCount = 26;
+        Transform[] sparks = new Transform[sparkCount];
+        Vector3[] velocities = new Vector3[sparkCount];
+
+        for (int i = 0; i < sparkCount; i++)
+        {
+            GameObject sp = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            sp.name = "MacFireworkSpark";
+            Destroy(sp.GetComponent<Collider>());
+            sp.transform.SetParent(parent, false);
+            sp.transform.position = burstOrigin;
+            sp.transform.localScale = Vector3.one * 0.11f;
+            sp.transform.rotation = UnityEngine.Random.rotation;
+
+            // Alternate crisp 1-bit white dither and pure black Macintosh pixel sparks
+            sp.GetComponent<Renderer>().sharedMaterial = ((i & 1) == 0) ? whiteWallMaterial : blackEdgeMaterial;
+            sparks[i] = sp.transform;
+            velocities[i] = UnityEngine.Random.onUnitSphere * UnityEngine.Random.Range(2.4f, 5.2f) + Vector3.up * 1.4f;
+        }
+
+        float duration = 1.45f;
+        float elapsed = 0f;
+        while (elapsed < duration)
+        {
+            if (parent == null) yield break;
+            float dt = Time.deltaTime;
+            elapsed += dt;
+            float t = Mathf.Clamp01(elapsed / duration);
+            float scale = Mathf.Lerp(0.12f, 0.01f, t);
+
+            for (int i = 0; i < sparkCount; i++)
+            {
+                if (sparks[i] == null) continue;
+                velocities[i] += Vector3.down * (4.8f * dt);
+                sparks[i].position += velocities[i] * dt;
+                sparks[i].Rotate(240f * dt, 180f * dt, 0f);
+                sparks[i].localScale = Vector3.one * scale;
+            }
+            yield return null;
+        }
+
+        for (int i = 0; i < sparkCount; i++)
+        {
+            if (sparks[i] != null) Destroy(sparks[i].gameObject);
+        }
+    }
+
+    /* ============================================================================
+     * INTERACTIVE WRIST MAP TABLET BUTTONS (RIGHT CONTROLLER RAY + DESKTOP CLICK)
+     * ============================================================================ */
+    void GetWristButtonRect(int btnIndex, out int x0, out int y0, out int w, out int h)
+    {
+        int barTop = fbHeight - BOT_BAR_HEIGHT;
+        if (btnIndex >= 0 && btnIndex <= 3)
+        {
+            // 4 circular Radio Buttons between "Easy" and "Hard"
+            int firstRadioCenterX = 72;
+            int radioSpacing = 28;
+            int cx = firstRadioCenterX + btnIndex * radioSpacing;
+            int cy = barTop + BOT_BAR_HEIGHT / 2;
+            w = 24;
+            h = 28;
+            x0 = cx - w / 2;
+            y0 = cy - h / 2;
+        }
+        else if (btnIndex == 4)
+        {
+            // "New Game" Macintosh Rounded-Rect Button
+            w = 114;
+            h = 30;
+            x0 = fbWidth - 246;
+            y0 = barTop + (BOT_BAR_HEIGHT - h) / 2;
+        }
+        else
+        {
+            // "Solution" / "Hide" Macintosh Rounded-Rect Button
+            w = 114;
+            h = 30;
+            x0 = fbWidth - 122;
+            y0 = barTop + (BOT_BAR_HEIGHT - h) / 2;
+        }
+    }
+
+    int HitTestWristButton(int fbX, int fbY)
+    {
+        if (fbY < fbHeight - BOT_BAR_HEIGHT) return -1;
+        for (int i = 0; i < 6; i++)
+        {
+            GetWristButtonRect(i, out int bx, out int by, out int bw, out int bh);
+            if (fbX >= bx && fbX < bx + bw && fbY >= by && fbY < by + bh)
+                return i;
+        }
+        return -1;
+    }
+
+    void ExecuteWristButtonAction(int btnIndex)
+    {
+        if (btnIndex >= 0 && btnIndex <= 3)
+        {
+            // Radio button: select skill level (Easy..Hard) without immediately regenerating the maze
+            SelectPendingSkillLevel(btnIndex);
+        }
+        else if (btnIndex == 4)
+        {
+            // "New Game" button: generate a new maze at the selected radio button skill level
+            StartNewMazeWithPendingSkill();
+        }
+        else if (btnIndex == 5)
+        {
+            // "Solution" button: toggle temporary solution display
+            ToggleSolutionDisplay();
+        }
+    }
+
+    bool IsRightTriggerOrSelectPressed()
+    {
+        bool pressed = false;
+        try
+        {
+            var rightHand = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(UnityEngine.XR.XRNode.RightHand);
+            if (rightHand.isValid)
+            {
+                if (rightHand.TryGetFeatureValue(UnityEngine.XR.CommonUsages.triggerButton, out bool trig) && trig) pressed = true;
+                if (rightHand.TryGetFeatureValue(UnityEngine.XR.CommonUsages.gripButton, out bool grip) && grip) pressed = true;
+            }
+
+            if (!pressed)
+            {
+                Type xrControllerType = Type.GetType("UnityEngine.InputSystem.XR.XRController, Unity.InputSystem");
+                Type inputControlType = Type.GetType("UnityEngine.InputSystem.InputControl, Unity.InputSystem");
+                MethodInfo tryGetChild = inputControlType?.GetMethod("TryGetChildControl", new Type[] { typeof(string) });
+                if (xrControllerType != null && tryGetChild != null)
+                {
+                    object rightDev = xrControllerType.GetProperty("rightHand", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                    if (rightDev != null)
+                    {
+                        foreach (string ctrlName in new string[] { "triggerPressed", "selectPressed", "gripPressed" })
+                        {
+                            object ctrl = tryGetChild.Invoke(rightDev, new object[] { ctrlName });
+                            if (ctrl != null)
+                            {
+                                var isPressedProp = ctrl.GetType().GetProperty("isPressed");
+                                if (isPressedProp != null && (bool)isPressedProp.GetValue(ctrl))
+                                {
+                                    pressed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+        return pressed;
+    }
+
+    void MonitorWristMapUIInteraction(ref bool needRedraw2D)
+    {
+        int newHover = -1;
+
+        if (wristMapObject != null && tryGetHitInfoMethod != null)
+        {
+            Transform screenTrans = wristMapObject.transform.Find("MacMapScreen");
+            if (screenTrans != null)
+            {
+                foreach (MonoBehaviour rayInteractor in rightInteractionRays)
+                {
+                    if (rayInteractor == null || !rayInteractor.gameObject.activeInHierarchy || !rayInteractor.enabled)
+                        continue;
+
+                    object[] args = new object[] { Vector3.zero, Vector3.zero, 0, false };
+                    bool hitAnything = (bool)tryGetHitInfoMethod.Invoke(rayInteractor, args);
+                    if (hitAnything)
+                    {
+                        Vector3 hitPos = (Vector3)args[0];
+                        Vector3 localHit = screenTrans.InverseTransformPoint(hitPos);
+                        if (Mathf.Abs(localHit.x) <= 0.52f && Mathf.Abs(localHit.y) <= 0.52f && Mathf.Abs(localHit.z) <= 0.08f)
+                        {
+                            float u = Mathf.Clamp01(localHit.x + 0.5f);
+                            float v = Mathf.Clamp01(localHit.y + 0.5f);
+                            int fbX = Mathf.Clamp(Mathf.FloorToInt(u * fbWidth), 0, fbWidth - 1);
+                            int fbY = Mathf.Clamp(Mathf.FloorToInt((1f - v) * fbHeight), 0, fbHeight - 1);
+                            newHover = HitTestWristButton(fbX, fbY);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (newHover != hoveredWristButtonIndex)
+        {
+            hoveredWristButtonIndex = newHover;
+            needRedraw2D = true;
+        }
+
+        bool triggerNow = IsRightTriggerOrSelectPressed();
+        if (triggerNow && !rightTriggerWasPressed && hoveredWristButtonIndex != -1)
+        {
+            ExecuteWristButtonAction(hoveredWristButtonIndex);
+        }
+        rightTriggerWasPressed = triggerNow;
     }
 
     void OnValidate()
@@ -3542,8 +4484,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     void DrawSquare2D(int r, int c)
     {
         if (r < 1 || r > MazeData.MaxRow || c < 1 || c > MazeData.MaxCol) return;
-        int ox = MARGIN_X + (c - 1) * TILE_STRIDE;
-        int oy = MARGIN_Y + (r - 1) * TILE_STRIDE;
+        int ox = mazeOffsetX + (c - 1) * TILE_STRIDE;
+        int oy = mazeOffsetY + (r - 1) * TILE_STRIDE;
 
         FillGrayRectFB(ox, oy, 16, 16);
 
@@ -3832,7 +4774,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         if (r == MazeData.EndPos.r && c == MazeData.EndPos.c)
         {
-            bool endOccupied = (MazeData.GetSquare(r, c, MazeData.EndPos.layer) & 0x30) != 0;
+            bool endOccupied = MazeData.GameWon || mazeSolvedState ||
+                               (MazeData.GetSquare(r, c, MazeData.EndPos.layer) & 0x30) != 0;
             byte endColor = (byte)(endOccupied ? 0 : 1);
             FillRectFB(ox + 4, oy + 4, 8, 8, endColor);
         }
@@ -3852,6 +4795,401 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
     }
 
+    private static Font loadedChicagoFont;
+    private static Texture2D chicagoFontTextureCPU;
+    private static Dictionary<char, CharacterInfo> chicagoCharInfoCache = new Dictionary<char, CharacterInfo>();
+    private const int CHICAGO_TARGET_FONT_SIZE = 16;
+
+    void EnsureChicagoFontLoaded()
+    {
+        if (loadedChicagoFont == null)
+        {
+            loadedChicagoFont = Resources.Load<Font>("Chicago");
+            if (loadedChicagoFont == null)
+            {
+                Font[] allFonts = Resources.FindObjectsOfTypeAll<Font>();
+                for (int i = 0; i < allFonts.Length; i++)
+                {
+                    if (allFonts[i] != null && allFonts[i].name.IndexOf("Chicago", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        loadedChicagoFont = allFonts[i];
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (loadedChicagoFont != null && (chicagoFontTextureCPU == null || chicagoCharInfoCache.Count == 0))
+        {
+            string neededChars = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz:.-!/•";
+            loadedChicagoFont.RequestCharactersInTexture(neededChars, CHICAGO_TARGET_FONT_SIZE, FontStyle.Normal);
+
+            Texture fontTex = loadedChicagoFont.material != null ? loadedChicagoFont.material.mainTexture : null;
+            if (fontTex != null && fontTex.width > 0 && fontTex.height > 0)
+            {
+                try
+                {
+                    RenderTexture rt = RenderTexture.GetTemporary(fontTex.width, fontTex.height, 0, RenderTextureFormat.ARGB32);
+                    Graphics.Blit(fontTex, rt);
+                    RenderTexture prev = RenderTexture.active;
+                    RenderTexture.active = rt;
+                    if (chicagoFontTextureCPU != null) Destroy(chicagoFontTextureCPU);
+                    chicagoFontTextureCPU = new Texture2D(fontTex.width, fontTex.height, TextureFormat.RGBA32, false);
+                    chicagoFontTextureCPU.ReadPixels(new Rect(0, 0, fontTex.width, fontTex.height), 0, 0);
+                    chicagoFontTextureCPU.Apply();
+                    RenderTexture.active = prev;
+                    RenderTexture.ReleaseTemporary(rt);
+
+                    chicagoCharInfoCache.Clear();
+                    for (int i = 0; i < neededChars.Length; i++)
+                    {
+                        char c = neededChars[i];
+                        if (loadedChicagoFont.GetCharacterInfo(c, out CharacterInfo info, CHICAGO_TARGET_FONT_SIZE, FontStyle.Normal))
+                        {
+                            chicagoCharInfoCache[c] = info;
+                        }
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    Debug.LogWarning("[Amazing] Chicago TrueType font GPU readback notice: " + ex.Message);
+                }
+            }
+        }
+    }
+
+    int MeasureChicagoText(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        EnsureChicagoFontLoaded();
+
+        if (chicagoFontTextureCPU != null && chicagoCharInfoCache.Count > 0)
+        {
+            int totalAdvance = 0;
+            for (int i = 0; i < text.Length; i++)
+            {
+                char ch = text[i];
+                if (chicagoCharInfoCache.TryGetValue(ch, out CharacterInfo info))
+                {
+                    totalAdvance += info.advance;
+                }
+                else if (chicagoCharInfoCache.TryGetValue(char.ToUpperInvariant(ch), out info))
+                {
+                    totalAdvance += info.advance;
+                }
+                else
+                {
+                    totalAdvance += 8;
+                }
+            }
+            return totalAdvance;
+        }
+
+        // Clean unscaled 1:1 fallback so text is never distorted
+        int fallbackW = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            char ch = text[i];
+            if (!CHICAGO_FONT.TryGetValue(ch, out ChicagoGlyph g))
+                CHICAGO_FONT.TryGetValue(char.ToUpperInvariant(ch), out g);
+            fallbackW += (g.rows != null ? g.width + 2 : 6);
+        }
+        return Mathf.Max(0, fallbackW - 2);
+    }
+
+    void DrawChicagoTextFB(int x, int y, string text, byte color)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        EnsureChicagoFontLoaded();
+
+        if (chicagoFontTextureCPU != null && chicagoCharInfoCache.Count > 0)
+        {
+            int curX = x;
+            int baselineY = y + 12; // Baseline inside the status/button line
+            for (int i = 0; i < text.Length; i++)
+            {
+                char ch = text[i];
+                if (!chicagoCharInfoCache.TryGetValue(ch, out CharacterInfo info))
+                {
+                    if (!chicagoCharInfoCache.TryGetValue(char.ToUpperInvariant(ch), out info))
+                    {
+                        curX += 8;
+                        continue;
+                    }
+                }
+
+                int glyphW = info.maxX - info.minX;
+                int glyphH = info.maxY - info.minY;
+
+                if (glyphW > 0 && glyphH > 0)
+                {
+                    for (int gy = 0; gy < glyphH; gy++)
+                    {
+                        float v = Mathf.Lerp(info.uvTopRight.y, info.uvBottomLeft.y, (gy + 0.5f) / glyphH);
+                        int py = baselineY - info.maxY + gy;
+
+                        for (int gx = 0; gx < glyphW; gx++)
+                        {
+                            float u = Mathf.Lerp(info.uvBottomLeft.x, info.uvTopRight.x, (gx + 0.5f) / glyphW);
+                            int px = curX + info.minX + gx;
+
+                            Color col = chicagoFontTextureCPU.GetPixelBilinear(u, v);
+                            float coverage = Mathf.Max(col.a, col.r);
+                            if (coverage > 0.40f)
+                            {
+                                SetPixelFB(px, py, color);
+                            }
+                        }
+                    }
+                }
+                curX += info.advance;
+            }
+            return;
+        }
+
+        // Clean unscaled 1:1 fallback (no pixel-doubling distortion)
+        int curXFallback = x;
+        for (int i = 0; i < text.Length; i++)
+        {
+            char ch = text[i];
+            if (!CHICAGO_FONT.TryGetValue(ch, out ChicagoGlyph g))
+                CHICAGO_FONT.TryGetValue(char.ToUpperInvariant(ch), out g);
+
+            if (g.rows != null)
+            {
+                for (int ry = 0; ry < g.rows.Length; ry++)
+                {
+                    string rowStr = g.rows[ry];
+                    for (int rx = 0; rx < g.width && rx < rowStr.Length; rx++)
+                    {
+                        if (rowStr[rx] == '#')
+                        {
+                            SetPixelFB(curXFallback + rx, y + ry, color);
+                        }
+                    }
+                }
+                curXFallback += g.width + 2;
+            }
+            else
+            {
+                curXFallback += 6;
+            }
+        }
+    }
+
+    void DrawMacRoundRectButtonFB(int x0, int y0, int w, int h, string label, bool inverted)
+    {
+        byte fillCol = (byte)(inverted ? 1 : 0);
+        byte textCol = (byte)(inverted ? 0 : 1);
+        int r = 5;
+
+        for (int py = y0; py < y0 + h; py++)
+        {
+            int cy = Mathf.Clamp(py, y0 + r, y0 + h - 1 - r);
+            for (int px = x0; px < x0 + w; px++)
+            {
+                int cx = Mathf.Clamp(px, x0 + r, x0 + w - 1 - r);
+                int dx = px - cx;
+                int dy = py - cy;
+                int distSq = dx * dx + dy * dy;
+
+                if (distSq > 29) continue; // Outside rounded corner
+
+                bool isBorder = (distSq >= 15) ||
+                                (px <= x0 + 1) || (px >= x0 + w - 2) ||
+                                (py <= y0 + 1) || (py >= y0 + h - 2);
+
+                SetPixelFB(px, py, isBorder ? (byte)1 : fillCol);
+            }
+        }
+
+        int textW = MeasureChicagoText(label);
+        int tx = x0 + (w - textW) / 2;
+        int ty = y0 + (h - 14) / 2;
+        DrawChicagoTextFB(tx, ty, label, textCol);
+    }
+
+    void DrawRadioButtonPrimitiveFB(int centerX, int centerY, bool selected, bool hovered)
+    {
+        // Authentic Macintosh radio button drawn with mathematical geometric primitives:
+        // - Crisp outer circle border
+        // - Clear white interior
+        // - Filled circular black center dot when selected
+        // - Subtle hover target indicator when pointed at by VR ray
+        const int radius = 7;
+        for (int dy = -radius - 1; dy <= radius + 1; dy++)
+        {
+            for (int dx = -radius - 1; dx <= radius + 1; dx++)
+            {
+                int distSq = dx * dx + dy * dy;
+                if (distSq > 50) continue; // Outside circular bounding region
+
+                int px = centerX + dx;
+                int py = centerY + dy;
+
+                if (distSq >= 32)
+                {
+                    // Clean circular black perimeter outline
+                    SetPixelFB(px, py, 1);
+                }
+                else if (selected && distSq <= 9)
+                {
+                    // Solid black center dot (diameter 5-6px)
+                    SetPixelFB(px, py, 1);
+                }
+                else if (hovered && !selected && distSq <= 4)
+                {
+                    // Subtle hover focus dot
+                    SetPixelFB(px, py, 1);
+                }
+                else
+                {
+                    // Clear white interior ring
+                    SetPixelFB(px, py, 0);
+                }
+            }
+        }
+    }
+
+    static string FormatTimeMMSS(float sec)
+    {
+        if (sec <= 0.01f) return "--:--";
+        int totalSec = Mathf.Clamp(Mathf.FloorToInt(sec), 0, 5999);
+        int mins = totalSec / 60;
+        int secs = totalSec % 60;
+        return string.Format("{0:00}:{1:00}", mins, secs);
+    }
+
+    void DrawTopStatsBar2D()
+    {
+        // Classic 1984 Mac Window Header / Status Bar (36px tall) with crisp 2px border
+        FillRectFB(0, 0, fbWidth, TOP_BAR_HEIGHT, 0);
+        FillRectFB(0, 0, fbWidth, 2, 1);
+        FillRectFB(0, TOP_BAR_HEIGHT - 2, fbWidth, 2, 1);
+        FillRectFB(0, 0, 2, TOP_BAR_HEIGHT, 1);
+        FillRectFB(fbWidth - 2, 0, 2, TOP_BAR_HEIGHT, 1);
+
+        int statsLvl = Mathf.Clamp(pendingSkillLevel, 0, 3);
+        int solves = levelSolveCounts[statsLvl];
+        float best = levelBestTimes[statsLvl];
+
+        string statusText = mazeSolvedState
+            ? string.Format("Solved!  Time: {0}   Solves: {1}   Best: {2}", FormatTimeMMSS(currentMazeElapsedSeconds), solves, FormatTimeMMSS(best))
+            : string.Format("Time: {0}    Lv.{1} Solves: {2}    Best: {3}", FormatTimeMMSS(currentMazeElapsedSeconds), statsLvl + 1, solves, FormatTimeMMSS(best));
+
+        int textW = MeasureChicagoText(statusText);
+        int startX = Mathf.Max(8, (fbWidth - textW) / 2);
+        int startY = (TOP_BAR_HEIGHT - 14) / 2;
+
+        if (mazeSolvedState)
+        {
+            FillRectFB(2, 2, fbWidth - 4, TOP_BAR_HEIGHT - 4, 1);
+            DrawChicagoTextFB(startX, startY, statusText, 0);
+        }
+        else
+        {
+            DrawChicagoTextFB(startX, startY, statusText, 1);
+        }
+    }
+
+    void DrawBottomButtonsBar2D()
+    {
+        int barY = fbHeight - BOT_BAR_HEIGHT;
+        FillRectFB(0, barY, fbWidth, BOT_BAR_HEIGHT, 0);
+        FillRectFB(0, barY, fbWidth, 2, 1);
+        FillRectFB(0, fbHeight - 2, fbWidth, 2, 1);
+        FillRectFB(0, barY, 2, BOT_BAR_HEIGHT, 1);
+        FillRectFB(fbWidth - 2, barY, 2, BOT_BAR_HEIGHT, 1);
+
+        int textY = barY + (BOT_BAR_HEIGHT - 14) / 2;
+        int radioCenterY = barY + BOT_BAR_HEIGHT / 2;
+
+        // 1. "Easy  (•) ( ) ( ) ( )  Hard" Radio Button Group on Left
+        DrawChicagoTextFB(12, textY, "Easy", 1);
+
+        for (int r = 0; r < 4; r++)
+        {
+            GetWristButtonRect(r, out int rx, out int ry, out int rw, out int rh);
+            int cx = rx + rw / 2;
+            bool isSelected = (pendingSkillLevel == r);
+            bool isHovered = (hoveredWristButtonIndex == r);
+            DrawRadioButtonPrimitiveFB(cx, radioCenterY, isSelected, isHovered);
+        }
+
+        DrawChicagoTextFB(176, textY, "Hard", 1);
+
+        // 2. "New Game" and "Solution" Macintosh Rounded-Rectangle Buttons on Right
+        GetWristButtonRect(4, out int newX, out int newY, out int newW, out int newH);
+        bool newInvert = (hoveredWristButtonIndex == 4);
+        DrawMacRoundRectButtonFB(newX, newY, newW, newH, "New Game", newInvert);
+
+        GetWristButtonRect(5, out int solX, out int solY, out int solW, out int solH);
+        bool solInvert = (hoveredWristButtonIndex == 5) || isShowingSolution;
+        string solLabel = isShowingSolution ? "Hide Sol" : "Solution";
+        DrawMacRoundRectButtonFB(solX, solY, solW, solH, solLabel, solInvert);
+    }
+
+    void DrawSolutionPathOverlay2D()
+    {
+        if (!isShowingSolution || activeSolutionNodes == null || activeSolutionNodes.Count < 2)
+            return;
+
+        // Draw crisp 1-bit dotted/dashed centerline along the shortest path from Player to Goal
+        for (int i = 0; i < activeSolutionNodes.Count - 1; i++)
+        {
+            var a = activeSolutionNodes[i];
+            var b = activeSolutionNodes[i + 1];
+
+            int ax = mazeOffsetX + (a.c - 1) * TILE_STRIDE + 7;
+            int ay = mazeOffsetY + (a.r - 1) * TILE_STRIDE + 7;
+            int bx = mazeOffsetX + (b.c - 1) * TILE_STRIDE + 7;
+            int by = mazeOffsetY + (b.r - 1) * TILE_STRIDE + 7;
+
+            bool aOcc = (MazeData.GetSquare(a.r, a.c, a.layer) & 0x30) != 0;
+            bool bOcc = (MazeData.GetSquare(b.r, b.c, b.layer) & 0x30) != 0;
+
+            int steps = Mathf.Max(Mathf.Abs(bx - ax), Mathf.Abs(by - ay));
+            for (int s = 0; s <= steps; s++)
+            {
+                if ((s & 2) != 0) continue;
+
+                int px = (steps == 0) ? ax : (ax + (bx - ax) * s / steps);
+                int py = (steps == 0) ? ay : (ay + (by - ay) * s / steps);
+                bool occ = (s < steps / 2) ? aOcc : bOcc;
+                byte col = (byte)(occ ? 0 : 1);
+
+                FillRectFB(px, py, 2, 2, col);
+            }
+        }
+    }
+
+    void DrawVictoryPenguinOverlay2D()
+    {
+        if (!mazeSolvedState) return;
+
+        int spriteH = PENGUIN_SPRITE_87X112.Length;
+        int spriteW = PENGUIN_SPRITE_87X112[0].Length;
+        int scale = 2;
+        int drawW = spriteW * scale;
+        int drawH = spriteH * scale;
+
+        int mazeAreaH = fbHeight - TOP_BAR_HEIGHT - BOT_BAR_HEIGHT;
+        int startX = (fbWidth - drawW) / 2;
+        int startY = TOP_BAR_HEIGHT + (mazeAreaH - drawH) / 2;
+
+        for (int sy = 0; sy < spriteH; sy++)
+        {
+            string row = PENGUIN_SPRITE_87X112[sy];
+            for (int sx = 0; sx < row.Length; sx++)
+            {
+                char ch = row[sx];
+                if (ch == ' ') continue; // Transparent outside rounded card & speech bubble
+                byte col = (byte)(ch == '#' ? 1 : 0);
+                FillRectFB(startX + sx * scale, startY + sy * scale, scale, scale, col);
+            }
+        }
+    }
+
     void RenderEntireMaze2D()
     {
         FillGrayRectFB(0, 0, fbWidth, fbHeight);
@@ -3860,10 +5198,15 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             for (int c = 1; c <= MazeData.MaxCol; c++)
                 DrawSquare2D(r, c);
 
-        FillRectFB(MARGIN_X - 1, MARGIN_Y - 1, MazeData.MaxCol * TILE_STRIDE + 2, 1, 1);
-        FillRectFB(MARGIN_X - 1, MARGIN_Y + MazeData.MaxRow * TILE_STRIDE, MazeData.MaxCol * TILE_STRIDE + 2, 1, 1);
-        FillRectFB(MARGIN_X - 1, MARGIN_Y - 1, 1, MazeData.MaxRow * TILE_STRIDE + 2, 1);
-        FillRectFB(MARGIN_X + MazeData.MaxCol * TILE_STRIDE, MARGIN_Y - 1, 1, MazeData.MaxRow * TILE_STRIDE + 2, 1);
+        FillRectFB(mazeOffsetX - 1, mazeOffsetY - 1, MazeData.MaxCol * TILE_STRIDE + 2, 1, 1);
+        FillRectFB(mazeOffsetX - 1, mazeOffsetY + MazeData.MaxRow * TILE_STRIDE, MazeData.MaxCol * TILE_STRIDE + 2, 1, 1);
+        FillRectFB(mazeOffsetX - 1, mazeOffsetY - 1, 1, MazeData.MaxRow * TILE_STRIDE + 2, 1);
+        FillRectFB(mazeOffsetX + MazeData.MaxCol * TILE_STRIDE, mazeOffsetY - 1, 1, MazeData.MaxRow * TILE_STRIDE + 2, 1);
+
+        DrawSolutionPathOverlay2D();
+        DrawVictoryPenguinOverlay2D();
+        DrawTopStatsBar2D();
+        DrawBottomButtonsBar2D();
 
         FlushFramebufferWithPlayerWedge();
     }
@@ -3903,8 +5246,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         if (activePlayerHeadOrBody != null)
         {
             Vector3 wp = activePlayerHeadOrBody.position;
-            float exactMapX = MARGIN_X + 7.5f + (wp.x / cellSize) * TILE_STRIDE;
-            float exactMapY = MARGIN_Y + 7.5f + (-wp.z / cellSize) * TILE_STRIDE;
+            float exactMapX = mazeOffsetX + 7.5f + (wp.x / cellSize) * TILE_STRIDE;
+            float exactMapY = mazeOffsetY + 7.5f + (-wp.z / cellSize) * TILE_STRIDE;
             Vector2 center = new Vector2(exactMapX, exactMapY);
 
             float rad = activePlayerHeadOrBody.eulerAngles.y * Mathf.Deg2Rad;
@@ -3924,8 +5267,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
             int minX = Mathf.Max(0, Mathf.FloorToInt(exactMapX - 7));
             int maxX = Mathf.Min(fbWidth - 1, Mathf.CeilToInt(exactMapX + 7));
-            int minY = Mathf.Max(0, Mathf.FloorToInt(exactMapY - 7));
-            int maxY = Mathf.Min(fbHeight - 1, Mathf.CeilToInt(exactMapY + 7));
+            int minY = Mathf.Max(TOP_BAR_HEIGHT, Mathf.FloorToInt(exactMapY - 7));
+            int maxY = Mathf.Min(fbHeight - BOT_BAR_HEIGHT - 1, Mathf.CeilToInt(exactMapY + 7));
 
             for (int py = minY; py <= maxY; py++)
             {
@@ -3940,7 +5283,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                             {
                                 int hx = px + dx;
                                 int hy = py + dy;
-                                if (hx >= 0 && hx < fbWidth && hy >= 0 && hy < fbHeight)
+                                if (hx >= 0 && hx < fbWidth && hy >= TOP_BAR_HEIGHT && hy < fbHeight - BOT_BAR_HEIGHT)
                                     fbColors[(fbHeight - 1 - hy) * fbWidth + hx] = halo;
                             }
                         }
@@ -3963,11 +5306,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         if (isRunMode && fbWidth > 36 && fbHeight > 12)
         {
-            for (int by = 1; by <= 7; by++)
+            for (int by = TOP_BAR_HEIGHT + 1; by <= TOP_BAR_HEIGHT + 7; by++)
             {
                 for (int bx = fbWidth - 25; bx <= fbWidth - 2; bx++)
                 {
-                    bool border = (by == 1 || by == 7 || bx == fbWidth - 25 || bx == fbWidth - 2);
+                    bool border = (by == TOP_BAR_HEIGHT + 1 || by == TOP_BAR_HEIGHT + 7 || bx == fbWidth - 25 || bx == fbWidth - 2);
                     fbColors[(fbHeight - 1 - by) * fbWidth + bx] = border ? white : black;
                 }
             }
@@ -4013,10 +5356,21 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     {
         if (showDesktopHudMap && mac2DMapTex != null)
         {
-            GUI.DrawTexture(
-                new Rect(12, 12, mac2DMapTex.width * hudMapScale, mac2DMapTex.height * hudMapScale),
-                mac2DMapTex
-            );
+            Rect mapRect = new Rect(12, 12, mac2DMapTex.width * hudMapScale, mac2DMapTex.height * hudMapScale);
+            GUI.DrawTexture(mapRect, mac2DMapTex);
+
+            Event ev = Event.current;
+            if (ev != null && ev.type == EventType.MouseDown && ev.button == 0 && mapRect.Contains(ev.mousePosition))
+            {
+                int fbX = Mathf.Clamp(Mathf.FloorToInt((ev.mousePosition.x - mapRect.x) / hudMapScale), 0, fbWidth - 1);
+                int fbY = Mathf.Clamp(Mathf.FloorToInt((ev.mousePosition.y - mapRect.y) / hudMapScale), 0, fbHeight - 1);
+                int hitBtn = HitTestWristButton(fbX, fbY);
+                if (hitBtn != -1)
+                {
+                    ExecuteWristButtonAction(hitBtn);
+                    ev.Use();
+                }
+            }
         }
     }
 }
@@ -4026,7 +5380,9 @@ public class SimpleDesktopMazeWalker : MonoBehaviour
     private AmazingMazeBuilder3D builder;
     private CharacterController cc;
     private Transform camTransform;
+#pragma warning disable 0414
     private float pitch = 0f;
+#pragma warning restore 0414
 
     public void Init(AmazingMazeBuilder3D builder, CharacterController cc, Transform cam)
     {

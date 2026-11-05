@@ -443,6 +443,13 @@ public class AmazingMazeData
 
         var nextNode = new NodePos(step.r, step.c, step.layer);
 
+        // Once the maze is solved, allow the player to keep moving around without altering the winning breadcrumb trail!
+        if (GameWon)
+        {
+            PlayerPos = nextNode;
+            return true;
+        }
+
         // Backtracking check: if stepping back into an earlier cell on our path, unwind the breadcrumb!
         int existingIdx = PathHistory.IndexOf(nextNode);
         if (existingIdx != -1)
@@ -509,5 +516,58 @@ public class AmazingMazeData
                 }
             }
         }
+    }
+
+    public List<NodePos> FindShortestPathToEnd()
+    {
+        return FindShortestPath(PlayerPos, EndPos);
+    }
+
+    public List<NodePos> FindShortestPath(NodePos fromNode, NodePos toNode)
+    {
+        var visited = new HashSet<NodePos>();
+        var parentMap = new Dictionary<NodePos, NodePos>();
+        var queue = new Queue<NodePos>();
+
+        visited.Add(fromNode);
+        queue.Enqueue(fromNode);
+
+        bool found = false;
+        while (queue.Count > 0)
+        {
+            NodePos cur = queue.Dequeue();
+            if (cur.Equals(toNode))
+            {
+                found = true;
+                break;
+            }
+
+            for (int dir = 0; dir < 4; dir++)
+            {
+                var stepOpt = CanMove(cur.r, cur.c, cur.layer, dir);
+                if (stepOpt.HasValue)
+                {
+                    NodePos next = new NodePos(stepOpt.Value.r, stepOpt.Value.c, stepOpt.Value.layer);
+                    if (visited.Add(next))
+                    {
+                        parentMap[next] = cur;
+                        queue.Enqueue(next);
+                    }
+                }
+            }
+        }
+
+        var path = new List<NodePos>();
+        if (!found) return path;
+
+        NodePos trace = toNode;
+        while (!trace.Equals(fromNode))
+        {
+            path.Add(trace);
+            trace = parentMap[trace];
+        }
+        path.Add(fromNode);
+        path.Reverse();
+        return path;
     }
 }
