@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (c) 2025 Rune Skovbo Johansen
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
@@ -268,6 +268,8 @@ fixed4 GetDither3DColor_(float2 uv_DitherTex, float4 screenPos, float2 dx, float
 {
     // Adjust brightness according to shader exposure and offset properties.
     color.rgb = saturate(color.rgb * _InputExposure + _InputOffset);
+    if (color.r <= 0.001 && color.g <= 0.001 && color.b <= 0.001)
+        return fixed4(0, 0, 0, color.a);
     
     #ifdef DITHERCOL_GRAYSCALE
         fixed4 dither = GetDither3D_(uv_DitherTex, screenPos, dx, dy, GetGrayscale(color));

@@ -6,9 +6,6 @@ Shader "Custom/NonEuclideanPortalMask"
     }
     SubShader
     {
-        // Render AFTER normal opaque walls (Geometry = 2000) so normal maze walls & arch pillars
-        // write their Z-depth first! Then the portal only stamps visible doorway openings (ZTest LEqual),
-        // and Cull Back ensures you NEVER stamp a portal when looking through the back of another doorway!
         Tags { "RenderType" = "Opaque" "Queue" = "Geometry+5" }
         ColorMask 0
         ZWrite Off
