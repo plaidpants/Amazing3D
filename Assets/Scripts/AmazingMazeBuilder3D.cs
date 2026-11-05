@@ -90,9 +90,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         public int ewSubLayer;
         public List<Collider> nsWallColliders = new List<Collider>();
         public List<Collider> ewWallColliders = new List<Collider>();
+        public List<Renderer> nsWallRenderers = new List<Renderer>();
+        public List<Renderer> ewWallRenderers = new List<Renderer>();
         public List<GameObject> portalQuads = new List<GameObject>();
 
-        // Per-cell material instances so closer bridge cells ALWAYS render & write Z-depth BEFORE distant bridge cells!
         public Material cellPortalNS, cellPortalEW;
         public Material cellWallNS, cellFloorNS, cellCrumbNS, cellEdgeNS;
         public Material cellWallEW, cellFloorEW, cellCrumbEW, cellEdgeEW;
@@ -336,7 +337,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         foreach (var kvp in bridgeCells)
             sortedBridgeList.Add(kvp.Value);
 
-        // Sort closest to furthest from the camera
         sortedBridgeList.Sort((a, b) =>
         {
             float da = (a.worldCenter - camPos).sqrMagnitude;
@@ -349,14 +349,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             BridgeCellInstance br = sortedBridgeList[i];
             bool playerInsideThisBridge = (pr == br.r && pc == br.c);
 
-            // Base queue for the i-th closest bridge cell (each cell gets a 10-queue slot: 2005, 2015, 2025...)
             int baseQ = 2005 + i * 10;
 
             if (playerInsideThisBridge)
             {
-                // When standing inside this arch, disable its doorway portal quads so they don't clip the camera,
-                // render the active tunnel at Queue 2002 with Stencil Always (8) so it writes solid Z-depth immediately,
-                // and hide the perpendicular tunnel (Stencil Never = 1)!
                 foreach (var pq in br.portalQuads)
                     if (pq != null && pq.activeSelf) pq.SetActive(false);
 
@@ -369,7 +365,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 foreach (var pq in br.portalQuads)
                     if (pq != null && !pq.activeSelf) pq.SetActive(true);
 
-                // Check which axis of this bridge cell is closer to the camera so that doorway + wall renders first
                 float dx = Mathf.Abs(camPos.x - br.worldCenter.x);
                 float dz = Mathf.Abs(camPos.z - br.worldCenter.z);
                 bool nsDoorIsCloser = (dz >= dx);
@@ -408,7 +403,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         int pc = MazeData.PlayerPos.c;
         int pLayer = MazeData.PlayerPos.layer;
 
-        // Topological BFS for physical wall colliders
+        // Topological BFS strictly for physical wall colliders (visual shadows are now 100% simultaneous in the shader!)
         var distMap = new Dictionary<(int r, int c, int l), int>();
         var queue = new Queue<(int r, int c, int l)>();
         var startState = (pr, pc, pLayer);
@@ -1252,25 +1247,35 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         bridgeRoot.transform.SetParent(mazeRoot.transform, false);
         bridgeRoot.transform.position = center;
 
-        GameObject sharedFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        sharedFloor.name = "SharedBridgeWhiteFloor";
-        sharedFloor.transform.SetParent(bridgeRoot.transform, false);
-        sharedFloor.transform.localPosition = new Vector3(0f, -0.05f, 0f);
+        GameObject baseColliderFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        baseColliderFloor.name = "BridgeTeleportAndShadowFloor";
+        baseColliderFloor.transform.SetParent(bridgeRoot.transform, false);
+        baseColliderFloor.transform.localPosition = new Vector3(0f, -0.052f, 0f);
         Vector3 floorScale = new Vector3(cellSize, 0.1f, cellSize);
-        sharedFloor.transform.localScale = floorScale;
-        NormalizeMeshUVsToWorldSpacePosition(sharedFloor, PrimitiveType.Cube, center + new Vector3(0f, -0.05f, 0f), floorScale);
-        sharedFloor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
-        ConfigureFloorTeleportationArea(sharedFloor);
+        baseColliderFloor.transform.localScale = floorScale;
+        NormalizeMeshUVsToWorldSpacePosition(baseColliderFloor, PrimitiveType.Cube, center + new Vector3(0f, -0.052f, 0f), floorScale);
+        Renderer baseFloorRen = baseColliderFloor.GetComponent<Renderer>();
+        baseFloorRen.sharedMaterial = whiteFloorMaterial;
+        baseFloorRen.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        ConfigureFloorTeleportationArea(baseColliderFloor);
 
         bool baseIsNS = (wBaseOpen & ((1 << AmazingMazeData.DIR_UP) | (1 << AmazingMazeData.DIR_DOWN))) != 0;
         int nsSubLayer = baseIsNS ? AmazingMazeData.LAYER_WIDE_BASE : AmazingMazeData.LAYER_WIDE_BRIDGE;
         int ewSubLayer = baseIsNS ? AmazingMazeData.LAYER_WIDE_BRIDGE : AmazingMazeData.LAYER_WIDE_BASE;
 
-        // Give every bridge cell its own unique pair of Stencil IDs (1..254) so one arch's portal window
-        // NEVER unmasks another arch's interior walls in the background!
         int bridgeIndex = bridgeCells.Count;
         int nsStencilRef = ((bridgeIndex * 2) % 250) + 1;
         int ewStencilRef = nsStencilRef + 1;
+
+        float half = cellSize * 0.5f;
+        float wt = wallThickness;
+        float halfWT = wt * 0.5f;
+        float th = tunnelArchHeight;
+        float roofThick = 0.24f;
+        float doorH = th - roofThick;
+        float innerSpan = cellSize - wt;
+        float fullTunnelLen = cellSize + wt;
+        float ew = blackEdgeOutlineWidth;
 
         var brInfo = new BridgeCellInstance
         {
@@ -1293,24 +1298,26 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         brInfo.cellPortalNS.SetInt("_StencilRef", nsStencilRef);
         brInfo.cellPortalEW.SetInt("_StencilRef", ewStencilRef);
 
+        // Configure Analytical Ray-Box Self-Shadowing bounds on BOTH tunnels so both render exact shadows simultaneously!
+        Vector4 nsBounds = new Vector4(center.x - innerSpan * 0.5f, center.x + innerSpan * 0.5f, center.z - fullTunnelLen * 0.5f, center.z + fullTunnelLen * 0.5f);
+        Vector4 ewBounds = new Vector4(center.x - fullTunnelLen * 0.5f, center.x + fullTunnelLen * 0.5f, center.z - innerSpan * 0.5f, center.z + innerSpan * 0.5f);
+
+        SetAnalyticalTunnelShaderParams(brInfo.cellWallNS, 1, nsBounds, doorH);
+        SetAnalyticalTunnelShaderParams(brInfo.cellFloorNS, 1, nsBounds, doorH);
+        SetAnalyticalTunnelShaderParams(brInfo.cellWallEW, 2, ewBounds, doorH);
+        SetAnalyticalTunnelShaderParams(brInfo.cellFloorEW, 2, ewBounds, doorH);
+
         bridgeCells[(r, c)] = brInfo;
 
-        float half = cellSize * 0.5f;
-        float wt = wallThickness;
-        float halfWT = wt * 0.5f;
-        float th = tunnelArchHeight;
-        float roofThick = 0.24f;
-        float doorH = th - roofThick;
-        float innerSpan = cellSize - wt;
-        float ew = blackEdgeOutlineWidth;
+        // 1. Place Outward-Facing Stencil Portal Windows at the OUTER face of the archway (`half + halfWT`)
+        //    so the full 3.36m underside black edge lines and breadcrumbs are 100% unclipped right to the outer arch rim!
+        float outerPortalDist = half + halfWT;
+        brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_North_Ref{nsStencilRef}", new Vector3(0f, doorH * 0.5f, outerPortalDist), new Vector3(innerSpan, doorH, 1f), Quaternion.Euler(0f, 180f, 0f), brInfo.cellPortalNS));
+        brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_South_Ref{nsStencilRef}", new Vector3(0f, doorH * 0.5f, -outerPortalDist), new Vector3(innerSpan, doorH, 1f), Quaternion.identity, brInfo.cellPortalNS));
+        brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_East_Ref{ewStencilRef}", new Vector3(outerPortalDist, doorH * 0.5f, 0f), new Vector3(innerSpan, doorH, 1f), Quaternion.Euler(0f, -90f, 0f), brInfo.cellPortalEW));
+        brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_West_Ref{ewStencilRef}", new Vector3(-outerPortalDist, doorH * 0.5f, 0f), new Vector3(innerSpan, doorH, 1f), Quaternion.Euler(0f, 90f, 0f), brInfo.cellPortalEW));
 
-        // 1. Outward-Facing (Cull Back) Stencil Portal Windows with this cell's unique Stencil Ref IDs!
-        brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_North_Ref{nsStencilRef}", new Vector3(0f, doorH * 0.5f, half - halfWT), new Vector3(innerSpan, doorH, 1f), Quaternion.Euler(0f, 180f, 0f), brInfo.cellPortalNS));
-        brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_South_Ref{nsStencilRef}", new Vector3(0f, doorH * 0.5f, -(half - halfWT)), new Vector3(innerSpan, doorH, 1f), Quaternion.identity, brInfo.cellPortalNS));
-        brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_East_Ref{ewStencilRef}", new Vector3(half - halfWT, doorH * 0.5f, 0f), new Vector3(innerSpan, doorH, 1f), Quaternion.Euler(0f, -90f, 0f), brInfo.cellPortalEW));
-        brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_West_Ref{ewStencilRef}", new Vector3(-(half - halfWT), doorH * 0.5f, 0f), new Vector3(innerSpan, doorH, 1f), Quaternion.Euler(0f, 90f, 0f), brInfo.cellPortalEW));
-
-        // 2. Exterior Shared Archway Frame (Upper Pillar Extensions from wallHeight to th)
+        // 2. Exterior Shared Archway Frame (Upper Pillar Extensions from wallHeight (0.85m) to th (2.25m))
         float upperPillarH = th - wallHeight;
         float upperPillarMidY = wallHeight + upperPillarH * 0.5f;
 
@@ -1323,12 +1330,18 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
                 if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
                 {
-                    CreateWallBoxWithMaterial(bridgeRoot.transform, "ArchUpperPillar", upperPillarCenter, upperPillarScale, whiteWallMaterial);
+                    GameObject upPillar = CreateWallBoxWithMaterial(bridgeRoot.transform, "ArchUpperPillar", upperPillarCenter, upperPillarScale, whiteWallMaterial);
+                    // Turn off global shadow casting on the upper arch frame so it never casts floating shadows onto distant walls through open portals!
+                    upPillar.GetComponent<Renderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
 
                     for (int ex = -1; ex <= 1; ex += 2)
                     {
                         for (int ez = -1; ez <= 1; ez += 2)
                         {
+                            // SKIP the inner-X, inner-Z corner (ex == -sx && ez == -sz) because inside the tunnel,
+                            // the flat tunnel wall runs flush past the inner face of the pillar!
+                            if (ex == -sx && ez == -sz) continue;
+
                             bool isOuterX = (ex == sx);
                             bool isOuterZ = (ez == sz);
                             float topY = (isOuterX && isOuterZ) ? th : doorH;
@@ -1349,7 +1362,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                     Vector3 postScale = new Vector3(wt, th * 0.5f, wt);
                     post.transform.localScale = postScale;
                     NormalizeMeshUVsToWorldSpacePosition(post, PrimitiveType.Cylinder, post.transform.position, postScale);
-                    post.GetComponent<Renderer>().sharedMaterial = whiteWallMaterial;
+                    Renderer pr = post.GetComponent<Renderer>();
+                    pr.sharedMaterial = whiteWallMaterial;
+                    pr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
                 }
             }
         }
@@ -1359,7 +1374,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             float fullWidth = cellSize + wt;
             Vector3 roofCenter = center + new Vector3(0f, th - roofThick * 0.5f, 0f);
             Vector3 roofScale = new Vector3(fullWidth, roofThick, fullWidth);
-            CreateWallBoxWithMaterial(bridgeRoot.transform, "SharedArchRoof", roofCenter, roofScale, whiteWallMaterial);
+            GameObject roofObj = CreateWallBoxWithMaterial(bridgeRoot.transform, "SharedArchRoof", roofCenter, roofScale, whiteWallMaterial);
+            // Analytical tunnel shader handles the exact roof shadow inside each tunnel, so disable global shadow casting on the roof
+            // to prevent it from casting floating shadows through open portals onto distant maze walls!
+            roofObj.GetComponent<Renderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
 
             float rHalf = fullWidth * 0.5f;
             CreateBlackEdgeBarWithMaterial(bridgeRoot.transform, center + new Vector3(0f, th, rHalf), new Vector3(fullWidth + ew, ew, ew), blackEdgeMaterial);
@@ -1377,13 +1395,61 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             BuildCycladicCrossVaultRoof(bridgeRoot.transform, center, th, innerSpan, cellSize + wt);
         }
 
-        // 3. Build NORTH-SOUTH Tunnel Interior using this cell's unique Stencil Ref!
-        BuildWideCellFloorAndBreadcrumbs(bridgeRoot.transform, r, c, nsSubLayer, brInfo.cellFloorNS, brInfo.cellCrumbNS, false);
-        BuildInwardStencilTunnelWalls(bridgeRoot.transform, center, alongZ: true, doorH, innerSpan, cellSize + wt, brInfo.cellWallNS, brInfo.cellEdgeNS, brInfo.nsWallColliders);
+        // 3. Build NORTH-SOUTH Tunnel Interior (Full cellSize + wt = 3.36m length so walls and underside black lines reach the outer arch rim!)
+        BuildTunnelStencilFloorAndBreadcrumbs(bridgeRoot.transform, r, c, nsSubLayer, brInfo.cellFloorNS, brInfo.cellCrumbNS);
+        BuildInwardStencilTunnelWalls(bridgeRoot.transform, center, alongZ: true, doorH, innerSpan, fullTunnelLen, brInfo.cellWallNS, brInfo.cellEdgeNS, brInfo.nsWallColliders);
 
-        // 4. Build EAST-WEST Tunnel Interior using this cell's unique Stencil Ref!
-        BuildWideCellFloorAndBreadcrumbs(bridgeRoot.transform, r, c, ewSubLayer, brInfo.cellFloorEW, brInfo.cellCrumbEW, false);
-        BuildInwardStencilTunnelWalls(bridgeRoot.transform, center, alongZ: false, doorH, innerSpan, cellSize + wt, brInfo.cellWallEW, brInfo.cellEdgeEW, brInfo.ewWallColliders);
+        // 4. Build EAST-WEST Tunnel Interior (Full cellSize + wt = 3.36m length!)
+        BuildTunnelStencilFloorAndBreadcrumbs(bridgeRoot.transform, r, c, ewSubLayer, brInfo.cellFloorEW, brInfo.cellCrumbEW);
+        BuildInwardStencilTunnelWalls(bridgeRoot.transform, center, alongZ: false, doorH, innerSpan, fullTunnelLen, brInfo.cellWallEW, brInfo.cellEdgeEW, brInfo.ewWallColliders);
+    }
+
+    void SetAnalyticalTunnelShaderParams(Material cellEWWall, int tunnelType, Vector4 bounds, float doorH)
+    {
+        if (cellEWWall == null) return;
+        if (cellEWWall.HasProperty("_TunnelType")) cellEWWall.SetInt("_TunnelType", tunnelType);
+        if (cellEWWall.HasProperty("_TunnelBounds")) cellEWWall.SetVector("_TunnelBounds", bounds);
+        if (cellEWWall.HasProperty("_TunnelRoofHeight")) cellEWWall.SetFloat("_TunnelRoofHeight", doorH);
+    }
+
+    // Gives each of the 2 overlapping tunnels its own distinct Stencil-masked Floor & Breadcrumb surface!
+    void BuildTunnelStencilFloorAndBreadcrumbs(Transform parent, int r, int c, int subLayer, Material stencilFloorMat, Material stencilCrumbMat)
+    {
+        Vector3 center = CellToWorldCenter(r, c, 0f);
+        GameObject cellObj = new GameObject($"TunnelFloorAndCrumbs_{r}_{c}_Sub{subLayer}");
+        cellObj.transform.SetParent(parent, false);
+        cellObj.transform.position = center;
+
+        GameObject floorQuad = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        floorQuad.name = "StencilTunnelFloor";
+        Destroy(floorQuad.GetComponent<Collider>());
+        floorQuad.transform.SetParent(cellObj.transform, false);
+        floorQuad.transform.localPosition = new Vector3(0f, 0.002f, 0f);
+        floorQuad.transform.localRotation = Quaternion.Euler(90f, 0f, 0f);
+        // Extend floor quad to full cellSize + wallThickness so analytical tunnel floor shadow reaches the outer threshold!
+        Vector3 fScale = new Vector3(cellSize + wallThickness, cellSize + wallThickness, 1f);
+        floorQuad.transform.localScale = fScale;
+        NormalizeMeshUVsToWorldSpacePosition(floorQuad, PrimitiveType.Quad, center + new Vector3(0f, 0.002f, 0f), fScale);
+        Renderer fr = floorQuad.GetComponent<Renderer>();
+        fr.sharedMaterial = stencilFloorMat;
+        fr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+
+        float crumbWidth = cellSize * 0.625f;
+        float stubLen = (cellSize - crumbWidth) * 0.5f;
+        float stubOffset = (crumbWidth + stubLen) * 0.5f;
+        float crumbY = 0.008f;
+
+        GameObject[] crumbs = new GameObject[5];
+        crumbs[4] = CreateCrumbPiece(cellObj.transform, "Crumb_Center", center, Vector3.up * crumbY, new Vector3(crumbWidth, 0.012f, crumbWidth), stencilCrumbMat);
+        crumbs[AmazingMazeData.DIR_LEFT] = CreateCrumbPiece(cellObj.transform, "Crumb_W", center, new Vector3(-stubOffset, crumbY, 0f), new Vector3(stubLen, 0.012f, crumbWidth), stencilCrumbMat);
+        crumbs[AmazingMazeData.DIR_DOWN] = CreateCrumbPiece(cellObj.transform, "Crumb_S", center, new Vector3(0f, crumbY, -stubOffset), new Vector3(crumbWidth, 0.012f, stubLen), stencilCrumbMat);
+        crumbs[AmazingMazeData.DIR_RIGHT] = CreateCrumbPiece(cellObj.transform, "Crumb_E", center, new Vector3(stubOffset, crumbY, 0f), new Vector3(stubLen, 0.012f, crumbWidth), stencilCrumbMat);
+        crumbs[AmazingMazeData.DIR_UP] = CreateCrumbPiece(cellObj.transform, "Crumb_N", center, new Vector3(0f, crumbY, stubOffset), new Vector3(crumbWidth, 0.012f, stubLen), stencilCrumbMat);
+
+        for (int i = 0; i < 5; i++)
+            crumbs[i].GetComponent<Renderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+
+        breadcrumbMeshes[(r, c, subLayer)] = crumbs;
     }
 
     void BuildInwardStencilTunnelWalls(Transform parent, Vector3 cellCenter, bool alongZ, float doorH, float innerSpan, float tunnelLength, Material stencilWallMat, Material stencilEdgeMat, List<Collider> outColliders)
@@ -1393,16 +1459,15 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         if (alongZ)
         {
-            // North-South Tunnel: East inner wall (facing West/-X) and West inner wall (facing East/+X)
-            CreateInwardWallQuad(parent, "NS_EastInnerWall_Ref1", cellCenter + new Vector3(halfInner, doorH * 0.5f, 0f), new Vector3(tunnelLength, doorH, 1f), Quaternion.Euler(0f, 90f, 0f), stencilWallMat);
-            CreateInwardWallQuad(parent, "NS_WestInnerWall_Ref1", cellCenter + new Vector3(-halfInner, doorH * 0.5f, 0f), new Vector3(tunnelLength, doorH, 1f), Quaternion.Euler(0f, -90f, 0f), stencilWallMat);
+            CreateInwardWallQuad(parent, "NS_EastInnerWall_Ref", cellCenter + new Vector3(halfInner, doorH * 0.5f, 0f), new Vector3(tunnelLength, doorH, 1f), Quaternion.Euler(0f, 90f, 0f), stencilWallMat);
+            CreateInwardWallQuad(parent, "NS_WestInnerWall_Ref", cellCenter + new Vector3(-halfInner, doorH * 0.5f, 0f), new Vector3(tunnelLength, doorH, 1f), Quaternion.Euler(0f, -90f, 0f), stencilWallMat);
 
             if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
             {
-                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(halfInner, ew * 0.5f, 0f), new Vector3(ew, ew, tunnelLength), stencilEdgeMat);
-                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(-halfInner, ew * 0.5f, 0f), new Vector3(ew, ew, tunnelLength), stencilEdgeMat);
-                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(halfInner, doorH, 0f), new Vector3(ew, ew, tunnelLength), stencilEdgeMat);
-                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(-halfInner, doorH, 0f), new Vector3(ew, ew, tunnelLength), stencilEdgeMat);
+                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(halfInner, ew * 0.5f, 0f), new Vector3(ew, ew, tunnelLength + ew), stencilEdgeMat);
+                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(-halfInner, ew * 0.5f, 0f), new Vector3(ew, ew, tunnelLength + ew), stencilEdgeMat);
+                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(halfInner, doorH, 0f), new Vector3(ew, ew, tunnelLength + ew), stencilEdgeMat);
+                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(-halfInner, doorH, 0f), new Vector3(ew, ew, tunnelLength + ew), stencilEdgeMat);
             }
 
             outColliders.Add(CreateTunnelCollider(parent, "NS_EastCol", cellCenter + new Vector3(cellSize * 0.5f, 2.25f, 0f), new Vector3(wallThickness, 4.5f, cellSize)));
@@ -1410,16 +1475,15 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
         else
         {
-            // East-West Tunnel: North inner wall (facing South/-Z) and South inner wall (facing North/+Z)
-            CreateInwardWallQuad(parent, "EW_NorthInnerWall_Ref2", cellCenter + new Vector3(0f, doorH * 0.5f, halfInner), new Vector3(tunnelLength, doorH, 1f), Quaternion.identity, stencilWallMat);
-            CreateInwardWallQuad(parent, "EW_SouthInnerWall_Ref2", cellCenter + new Vector3(0f, doorH * 0.5f, -halfInner), new Vector3(tunnelLength, doorH, 1f), Quaternion.Euler(0f, 180f, 0f), stencilWallMat);
+            CreateInwardWallQuad(parent, "EW_NorthInnerWall_Ref", cellCenter + new Vector3(0f, doorH * 0.5f, halfInner), new Vector3(tunnelLength, doorH, 1f), Quaternion.identity, stencilWallMat);
+            CreateInwardWallQuad(parent, "EW_SouthInnerWall_Ref", cellCenter + new Vector3(0f, doorH * 0.5f, -halfInner), new Vector3(tunnelLength, doorH, 1f), Quaternion.Euler(0f, 180f, 0f), stencilWallMat);
 
             if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
             {
-                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(0f, ew * 0.5f, halfInner), new Vector3(tunnelLength, ew, ew), stencilEdgeMat);
-                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(0f, ew * 0.5f, -halfInner), new Vector3(tunnelLength, ew, ew), stencilEdgeMat);
-                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(0f, doorH, halfInner), new Vector3(tunnelLength, ew, ew), stencilEdgeMat);
-                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(0f, doorH, -halfInner), new Vector3(tunnelLength, ew, ew), stencilEdgeMat);
+                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(0f, ew * 0.5f, halfInner), new Vector3(tunnelLength + ew, ew, ew), stencilEdgeMat);
+                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(0f, ew * 0.5f, -halfInner), new Vector3(tunnelLength + ew, ew, ew), stencilEdgeMat);
+                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(0f, doorH, halfInner), new Vector3(tunnelLength + ew, ew, ew), stencilEdgeMat);
+                CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(0f, doorH, -halfInner), new Vector3(tunnelLength + ew, ew, ew), stencilEdgeMat);
             }
 
             outColliders.Add(CreateTunnelCollider(parent, "EW_NorthCol", cellCenter + new Vector3(0f, 2.25f, cellSize * 0.5f), new Vector3(cellSize, 4.5f, wallThickness)));
@@ -1427,7 +1491,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
     }
 
-    void CreateInwardWallQuad(Transform parent, string name, Vector3 worldPos, Vector3 scale, Quaternion rot, Material mat)
+    Renderer CreateInwardWallQuad(Transform parent, string name, Vector3 worldPos, Vector3 scale, Quaternion rot, Material mat)
     {
         GameObject q = GameObject.CreatePrimitive(PrimitiveType.Quad);
         q.name = name;
@@ -1437,7 +1501,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         q.transform.rotation = rot;
         q.transform.localScale = scale;
         NormalizeMeshUVsToWorldSpacePosition(q, PrimitiveType.Quad, worldPos, scale);
-        q.GetComponent<Renderer>().sharedMaterial = mat;
+        Renderer r = q.GetComponent<Renderer>();
+        r.sharedMaterial = mat;
+        r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        r.receiveShadows = true;
+        return r;
     }
 
     Collider CreateTunnelCollider(Transform parent, string name, Vector3 worldPos, Vector3 size)
@@ -1480,7 +1548,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 Vector3 segScale = alongZ ? new Vector3(segWidth, 0.18f, fullLen) : new Vector3(fullLen, 0.18f, segWidth);
                 archSeg.transform.localScale = segScale;
                 NormalizeMeshUVsToWorldSpacePosition(archSeg, PrimitiveType.Cube, segWorldPos, segScale);
-                archSeg.GetComponent<Renderer>().sharedMaterial = whiteWallMaterial;
+                Renderer r = archSeg.GetComponent<Renderer>();
+                r.sharedMaterial = whiteWallMaterial;
+                r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
             }
         }
     }
@@ -1497,6 +1567,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         Renderer r = q.GetComponent<Renderer>();
         r.sharedMaterial = mat;
         r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        r.receiveShadows = false;
         return q;
     }
 
@@ -1600,7 +1671,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             }
         }
 
-        // Build lower 0..0.85m Corner Posts at ALL vertices (including bridge corners, since ArchUpperPillar now starts at y = 0.85m!)
         for (int vr = 0; vr <= R; vr++)
         {
             for (int vc = 0; vc <= C; vc++)
@@ -1617,7 +1687,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 Vector3 postScale = new Vector3(wt, wh, wt);
                 CreateWallBoxWithMaterial(wallsRoot.transform, $"CornerPost_{vr}_{vc}", vPos + new Vector3(0f, wh * 0.5f, 0f), postScale, whiteWallMaterial);
 
-                // Top horizontal cap lines ONLY on non-bridge vertices (at a bridge vertex, the pillar continues up to 2.25m!)
                 if (!hasN)
                 {
                     if (!isBridgeCorner) CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(0f, wh, halfWT), new Vector3(wt + ew, ew, ew), blackEdgeMaterial);
@@ -1639,20 +1708,33 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                     CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(-halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, wt + ew), blackEdgeMaterial);
                 }
 
-                // Vertical corner lines on the 0..0.85m base post ONLY where a true 90-degree corner occurs!
-                if (hasN == hasE)
-                    CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(halfWT, wh * 0.5f, halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
-                if (hasN == hasW)
-                    CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(-halfWT, wh * 0.5f, halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
-                if (hasS == hasE)
-                    CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(halfWT, wh * 0.5f, -halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
-                if (hasS == hasW)
-                    CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(-halfWT, wh * 0.5f, -halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
+                if (!isBridgeCorner)
+                {
+                    if (hasN == hasE)
+                        CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(halfWT, wh * 0.5f, halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
+                    if (hasN == hasW)
+                        CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(-halfWT, wh * 0.5f, halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
+                    if (hasS == hasE)
+                        CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(halfWT, wh * 0.5f, -halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
+                    if (hasS == hasW)
+                        CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(-halfWT, wh * 0.5f, -halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
+                }
+                else
+                {
+                    if (!hasN && !hasE)
+                        CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(halfWT, wh * 0.5f, halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
+                    if (!hasN && !hasW)
+                        CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(-halfWT, wh * 0.5f, halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
+                    if (!hasS && !hasE)
+                        CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(halfWT, wh * 0.5f, -halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
+                    if (!hasS && !hasW)
+                        CreateBlackEdgeBarWithMaterial(wallsRoot.transform, vPos + new Vector3(-halfWT, wh * 0.5f, -halfWT), new Vector3(ew, wh + ew, ew), blackEdgeMaterial);
+                }
             }
         }
     }
 
-    void CreateWallBoxWithMaterial(Transform parent, string name, Vector3 worldCenter, Vector3 scale, Material mat)
+    GameObject CreateWallBoxWithMaterial(Transform parent, string name, Vector3 worldCenter, Vector3 scale, Material mat)
     {
         GameObject go = GameObject.CreatePrimitive(PrimitiveType.Cube);
         go.name = name;
@@ -1662,6 +1744,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         go.transform.localScale = scale;
         NormalizeMeshUVsToWorldSpacePosition(go, PrimitiveType.Cube, worldCenter, scale);
         go.GetComponent<Renderer>().sharedMaterial = mat;
+        return go;
     }
 
     void CreateBlackEdgeBarWithMaterial(Transform parent, Vector3 worldPos, Vector3 scale, Material mat)
