@@ -181,12 +181,19 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     private List<AmazingMazeData.NodePos> activeSolutionNodes = new List<AmazingMazeData.NodePos>();
 
     private AudioSource windAudioSource;
+    private AudioLowPassFilter windLowPassFilter;
+    private AudioSource tunnelRoomAudioSource;
+    private AudioSource upperSkyAudioSource;
     private AudioSource fanfareAudioSource;
     private AudioSource sfxAudioSource;
     private AudioClip windLoopClip;
+    private AudioClip tunnelRoomLoopClip;
+    private AudioClip upperSkyLoopClip;
     private AudioClip clickBlipClip;
     private AudioClip victoryFanfareClip;
     private AudioClip fireworkPopClip;
+    private float currentTunnelAudioBlend = 0f;
+    private float currentUpperAudioBlend = 0f;
     private GameObject activeFireworksRoot;
     private Coroutine activeFireworksCoroutine;
 
@@ -505,16 +512,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             }
         }
 
-        // Modulate ambient wind subtly with player height and auto-resume if XR session paused it at startup
-        if (windAudioSource != null)
-        {
-            if (!windAudioSource.isPlaying && windAudioSource.clip != null)
-                windAudioSource.Play();
-
-            float heightFactor = Mathf.Clamp01(activePlayerHeadOrBody.position.y / Mathf.Max(1f, upperFloorY));
-            windAudioSource.volume = Mathf.Lerp(0.32f, 0.50f, heightFactor);
-            windAudioSource.pitch = Mathf.Lerp(0.95f, 1.12f, heightFactor);
-        }
+        // Dynamically shape ambient audio for Lower Maze (Pine Forest), Arch Tunnels (Enclosed Room), and Upper Catwalks (Open Sky)
+        UpdateDynamicAcousticEnvironment(activePlayerHeadOrBody.position);
 
         PollJoystickHatRunToggleSafe();
         MonitorWristMapUIInteraction(ref needRedraw2D);
@@ -2291,10 +2290,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                     CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(0f, nwh, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
                     CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, nwh, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
 
-                    // Exterior bottom edge bars at -floorThick so the bottom outline continues seamlessly across the pillar
-                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(0f, -floorThick, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
-                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, -floorThick, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
-
                     // Outer vertical corner bar extending from -floorThick all the way to the roof top (th)
                     float fullCornerH = th + floorThick;
                     float fullCornerMidY = (th - floorThick) * 0.5f;
@@ -3890,6 +3885,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         if (windLoopClip == null)
             windLoopClip = CreateProceduralPineForestWindLoopClip(16.0f, sr);
+        if (tunnelRoomLoopClip == null)
+            tunnelRoomLoopClip = CreateProceduralArchTunnelRoomLoopClip(12.0f, sr);
+        if (upperSkyLoopClip == null)
+            upperSkyLoopClip = CreateProceduralUpperOpenSkyWindLoopClip(16.0f, sr);
         if (clickBlipClip == null)
             clickBlipClip = CreateProceduralMacBlipClip(sr);
         if (victoryFanfareClip == null)
@@ -3907,10 +3906,47 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             windAudioSource.loop = true;
             windAudioSource.spatialBlend = 0f;
             windAudioSource.priority = 0;
-            windAudioSource.volume = 0.11f;
+            windAudioSource.volume = 0.32f;
             windAudioSource.playOnAwake = true;
             windAudioSource.ignoreListenerPause = true;
+
+            windLowPassFilter = windObj.AddComponent<AudioLowPassFilter>();
+            windLowPassFilter.cutoffFrequency = 2600f;
+            windLowPassFilter.lowpassResonanceQ = 1.0f;
+
             windAudioSource.Play();
+        }
+
+        if (tunnelRoomAudioSource == null)
+        {
+            GameObject roomObj = new GameObject("ArchTunnelRoomAudio");
+            roomObj.transform.SetParent(audioParent, false);
+            roomObj.transform.localPosition = Vector3.zero;
+            tunnelRoomAudioSource = roomObj.AddComponent<AudioSource>();
+            tunnelRoomAudioSource.clip = tunnelRoomLoopClip;
+            tunnelRoomAudioSource.loop = true;
+            tunnelRoomAudioSource.spatialBlend = 0f;
+            tunnelRoomAudioSource.priority = 1;
+            tunnelRoomAudioSource.volume = 0f;
+            tunnelRoomAudioSource.playOnAwake = true;
+            tunnelRoomAudioSource.ignoreListenerPause = true;
+            tunnelRoomAudioSource.Play();
+        }
+
+        if (upperSkyAudioSource == null)
+        {
+            GameObject skyObj = new GameObject("UpperOpenSkyWindAudio");
+            skyObj.transform.SetParent(audioParent, false);
+            skyObj.transform.localPosition = Vector3.zero;
+            upperSkyAudioSource = skyObj.AddComponent<AudioSource>();
+            upperSkyAudioSource.clip = upperSkyLoopClip;
+            upperSkyAudioSource.loop = true;
+            upperSkyAudioSource.spatialBlend = 0f;
+            upperSkyAudioSource.priority = 2;
+            upperSkyAudioSource.volume = 0f;
+            upperSkyAudioSource.playOnAwake = true;
+            upperSkyAudioSource.ignoreListenerPause = true;
+            upperSkyAudioSource.Play();
         }
 
         if (fanfareAudioSource == null)
@@ -4024,6 +4060,247 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         NormalizeStereoBuffer(stereoData, totalFrames, 0.42f);
         AudioClip clip = AudioClip.Create("PineForestWindLoop", totalFrames, 2, sampleRate, false);
+        clip.SetData(stereoData, 0);
+        return clip;
+    }
+
+    void UpdateDynamicAcousticEnvironment(Vector3 headWorldPos)
+    {
+        if (windAudioSource != null && !windAudioSource.isPlaying && windAudioSource.clip != null)
+            windAudioSource.Play();
+        if (tunnelRoomAudioSource != null && !tunnelRoomAudioSource.isPlaying && tunnelRoomAudioSource.clip != null)
+            tunnelRoomAudioSource.Play();
+        if (upperSkyAudioSource != null && !upperSkyAudioSource.isPlaying && upperSkyAudioSource.clip != null)
+            upperSkyAudioSource.Play();
+
+        if (MazeData == null) return;
+
+        // 1. Compute Upper-Level Open Sky exposure (0 on lower maze floor -> 1 on upper narrow catwalks)
+        float targetFloorY = GetTargetPlayerFloorY(headWorldPos);
+        float targetUpper = Mathf.SmoothStep(0f, 1f, Mathf.Clamp01(targetFloorY / Mathf.Max(1f, upperFloorY)));
+
+        // 2. Compute a wide, overlapping Arch Tunnel spatial field (begins ~2.8m outside the doorway and peaks inside)
+        //    so audio transitions begin gradually as you approach an arch and linger smoothly as you exit.
+        float targetTunnel = 0f;
+        int pLayer = MazeData.PlayerPos.layer;
+        int playerPlaneBase = AmazingMazeData.BaseLayerOfPlane(pLayer);
+
+        foreach (var kvp in bridgeCells)
+        {
+            BridgeCellInstance br = kvp.Value;
+            if (br.planeBaseLayer != playerPlaneBase) continue;
+
+            float absDX = Mathf.Abs(headWorldPos.x - br.worldCenter.x);
+            float absDZ = Mathf.Abs(headWorldPos.z - br.worldCenter.z);
+            float portalOuterDist = br.archHalfSpan + br.archWallThick * 0.5f;
+            float corridorHalfW = (br.archHalfSpan - br.archWallThick * 0.5f) + 0.35f;
+            float outerApproachReach = portalOuterDist + 1.60f; // Overlap gently just outside arch opening
+
+            bool nearCorridorNS = (absDX <= corridorHalfW && absDZ <= outerApproachReach);
+            bool nearCorridorEW = (absDZ <= corridorHalfW && absDX <= outerApproachReach);
+
+            if (nearCorridorNS || nearCorridorEW)
+            {
+                float dAlong = nearCorridorNS ? absDZ : absDX;
+                float dAcross = nearCorridorNS ? absDX : absDZ;
+
+                // Axial fade: 1.0 deep inside the arch, smoothly tapering to 0.0 at outerApproachReach
+                float innerFullDist = Mathf.Max(0.25f, portalOuterDist - 0.35f);
+                float axialT = 1.0f - Mathf.Clamp01((dAlong - innerFullDist) / (outerApproachReach - innerFullDist));
+
+                // Lateral fade near corridor walls so passing perpendicular to an arch stays gentle
+                float innerHalfW = Mathf.Max(0.20f, corridorHalfW - 0.35f);
+                float lateralT = 1.0f - Mathf.Clamp01((dAcross - innerHalfW) / 0.35f);
+
+                float cellEnc = Mathf.SmoothStep(0f, 1f, axialT * lateralT);
+                if (cellEnc > targetTunnel) targetTunnel = cellEnc;
+            }
+        }
+
+        // 3. Responsive, overlapping crossfade (~1.2 - 1.5 seconds full sweep, cut in half from previous ~3s)
+        //    for natural, timely transitions between open air and enclosed arch tunnels.
+        float dt = Time.deltaTime;
+        float tunnelStep = Mathf.MoveTowards(currentTunnelAudioBlend, targetTunnel, dt * 0.76f);
+        currentTunnelAudioBlend = Mathf.Lerp(currentTunnelAudioBlend, tunnelStep, Mathf.Clamp01(dt * 3.0f));
+
+        float upperStep = Mathf.MoveTowards(currentUpperAudioBlend, targetUpper, dt * 0.70f);
+        currentUpperAudioBlend = Mathf.Lerp(currentUpperAudioBlend, upperStep, Mathf.Clamp01(dt * 2.5f));
+
+        float smoothTunnel = Mathf.SmoothStep(0f, 1f, currentTunnelAudioBlend);
+        float smoothUpper  = Mathf.SmoothStep(0f, 1f, currentUpperAudioBlend);
+
+        // 4. Modulate Main Pine Forest Breeze + Logarithmic (Octave-Even) Low-Pass Occlusion Filter
+        if (windAudioSource != null)
+        {
+            // Keep a generous overlap floor (0.20 inside tunnel) so the outdoor breeze never drops out abruptly
+            float openVol = Mathf.Lerp(0.32f, 0.39f, smoothUpper);
+            windAudioSource.volume = Mathf.Lerp(openVol, 0.20f, smoothTunnel);
+
+            // Subtle, natural pitch shift without abrupt tape-speed warping
+            float openPitch = Mathf.Lerp(0.96f, 1.04f, smoothUpper);
+            windAudioSource.pitch = Mathf.Lerp(openPitch, 0.90f, smoothTunnel);
+        }
+
+        if (windLowPassFilter != null)
+        {
+            // Logarithmic (octave-linear) cutoff interpolation: 2600 Hz lower -> 6800 Hz upper -> 420 Hz inside arch
+            float openCutoff = Mathf.Exp(Mathf.Lerp(Mathf.Log(2600f), Mathf.Log(6800f), smoothUpper));
+            float targetCutoff = Mathf.Exp(Mathf.Lerp(Mathf.Log(openCutoff), Mathf.Log(420f), smoothTunnel));
+            windLowPassFilter.cutoffFrequency = targetCutoff;
+            windLowPassFilter.lowpassResonanceQ = Mathf.Lerp(1.0f, 1.18f, smoothTunnel);
+        }
+
+        // 5. Overlapping Crossfade for Enclosed Arch Room Acoustics (lingers gently on exit)
+        if (tunnelRoomAudioSource != null)
+        {
+            float roomEnv = Mathf.Pow(smoothTunnel, 0.75f); // Rises early and lingers softly for smooth overlap
+            tunnelRoomAudioSource.volume = 0.25f * roomEnv;
+            tunnelRoomAudioSource.pitch = Mathf.Lerp(0.94f, 1.00f, smoothUpper);
+        }
+
+        // 6. Overlapping Crossfade for Upper-Level Open Sky & Treetop Gusts
+        if (upperSkyAudioSource != null)
+        {
+            float skyExposure = smoothUpper * (1.0f - 0.70f * smoothTunnel);
+            upperSkyAudioSource.volume = 0.28f * skyExposure;
+            upperSkyAudioSource.pitch = Mathf.Lerp(0.98f, 1.08f, smoothUpper);
+        }
+    }
+
+    static AudioClip CreateProceduralArchTunnelRoomLoopClip(float durationSec, int sampleRate)
+    {
+        int totalFrames = Mathf.RoundToInt(durationSec * sampleRate);
+        float[] stereoData = new float[totalFrames * 2];
+        System.Random prng = new System.Random(4219);
+
+        float[] rawL = new float[totalFrames];
+        float[] rawR = new float[totalFrames];
+        for (int i = 0; i < totalFrames; i++)
+        {
+            rawL[i] = (float)(prng.NextDouble() * 2.0 - 1.0);
+            rawR[i] = (float)(prng.NextDouble() * 2.0 - 1.0);
+        }
+
+        // Hollow enclosed chamber acoustics: warm low-frequency room air + short wall comb reflections (17ms L / 23ms R)
+        int combDelayL = Mathf.Max(1, Mathf.RoundToInt(0.017f * sampleRate));
+        int combDelayR = Mathf.Max(1, Mathf.RoundToInt(0.023f * sampleRate));
+        float[] combBufL = new float[combDelayL];
+        float[] combBufR = new float[combDelayR];
+        int combIdxL = 0, combIdxR = 0;
+
+        float lp1L = 0f, lp2L = 0f;
+        float lp1R = 0f, lp2R = 0f;
+        int warmup = sampleRate * 2;
+
+        for (int pass = -warmup; pass < totalFrames; pass++)
+        {
+            int idx = (pass + totalFrames * 4) % totalFrames;
+            float normPhase = idx / (float)totalFrames;
+
+            // Slow gentle draft modulation inside the tunnel
+            float draftL = 0.55f + 0.28f * Mathf.Sin(normPhase * Mathf.PI * 2f * 1f)
+                                 + 0.17f * Mathf.Sin(normPhase * Mathf.PI * 2f * 3f + 1.2f);
+            float draftR = 0.55f + 0.28f * Mathf.Sin(normPhase * Mathf.PI * 2f * 1f + 0.8f)
+                                 + 0.17f * Mathf.Sin(normPhase * Mathf.PI * 2f * 3f + 2.3f);
+
+            // Deep enclosed room low-pass (~145 Hz)
+            float aRoom = Mathf.Clamp(2f * Mathf.PI * 145f / sampleRate, 0.002f, 0.08f);
+            lp1L += aRoom * (rawL[idx] - lp1L);
+            lp2L += aRoom * (lp1L - lp2L);
+
+            lp1R += aRoom * (rawR[idx] - lp1R);
+            lp2R += aRoom * (lp1R - lp2R);
+
+            // Short stone-wall comb reflection for authentic indoor room hollowness
+            float delayedL = combBufL[combIdxL];
+            float outL = lp2L * draftL + delayedL * 0.52f;
+            combBufL[combIdxL] = outL;
+            combIdxL = (combIdxL + 1) % combDelayL;
+
+            float delayedR = combBufR[combIdxR];
+            float outR = lp2R * draftR + delayedR * 0.52f;
+            combBufR[combIdxR] = outR;
+            combIdxR = (combIdxR + 1) % combDelayR;
+
+            if (pass >= 0)
+            {
+                stereoData[idx * 2]     = outL;
+                stereoData[idx * 2 + 1] = outR;
+            }
+        }
+
+        NormalizeStereoBuffer(stereoData, totalFrames, 0.38f);
+        AudioClip clip = AudioClip.Create("ArchTunnelRoomLoop", totalFrames, 2, sampleRate, false);
+        clip.SetData(stereoData, 0);
+        return clip;
+    }
+
+    static AudioClip CreateProceduralUpperOpenSkyWindLoopClip(float durationSec, int sampleRate)
+    {
+        int totalFrames = Mathf.RoundToInt(durationSec * sampleRate);
+        float[] stereoData = new float[totalFrames * 2];
+        System.Random prng = new System.Random(8419);
+
+        float[] rawL = new float[totalFrames];
+        float[] rawR = new float[totalFrames];
+        for (int i = 0; i < totalFrames; i++)
+        {
+            rawL[i] = (float)(prng.NextDouble() * 2.0 - 1.0);
+            rawR[i] = (float)(prng.NextDouble() * 2.0 - 1.0);
+        }
+
+        // Open-Sky Upper Canopy Breeze: wide stereo high-treetop needle shimmer + airy open-sky breeze sweep
+        float lpSweepL = 0f, lpSweepR = 0f;
+        float lpSubL = 0f, lpSubR = 0f;
+        float bpShimmerL = 0f, bpShimmerR = 0f;
+        int warmup = sampleRate * 2;
+
+        for (int pass = -warmup; pass < totalFrames; pass++)
+        {
+            int idx = (pass + totalFrames * 4) % totalFrames;
+            float normPhase = idx / (float)totalFrames;
+
+            float skyGustL = 0.44f + 0.24f * Mathf.Sin(normPhase * Mathf.PI * 2f * 2f + 0.3f)
+                                   + 0.18f * Mathf.Sin(normPhase * Mathf.PI * 2f * 5f + 1.7f)
+                                   + 0.14f * Mathf.Sin(normPhase * Mathf.PI * 2f * 9f + 0.6f);
+            float skyGustR = 0.44f + 0.24f * Mathf.Sin(normPhase * Mathf.PI * 2f * 2f + 1.4f)
+                                   + 0.18f * Mathf.Sin(normPhase * Mathf.PI * 2f * 5f + 2.9f)
+                                   + 0.14f * Mathf.Sin(normPhase * Mathf.PI * 2f * 9f + 2.1f);
+
+            skyGustL = Mathf.Clamp01(skyGustL);
+            skyGustR = Mathf.Clamp01(skyGustR);
+
+            // Sweeping airy mid-high breeze (420 Hz - 980 Hz)
+            float fSweepL = Mathf.Lerp(420f, 980f, skyGustL);
+            float aSweepL = Mathf.Clamp(2f * Mathf.PI * fSweepL / sampleRate, 0.01f, 0.35f);
+            float aSubL = aSweepL * 0.45f;
+            lpSweepL += aSweepL * (rawL[idx] - lpSweepL);
+            lpSubL += aSubL * (lpSweepL - lpSubL);
+
+            float fSweepR = Mathf.Lerp(420f, 980f, skyGustR);
+            float aSweepR = Mathf.Clamp(2f * Mathf.PI * fSweepR / sampleRate, 0.01f, 0.35f);
+            float aSubR = aSweepR * 0.45f;
+            lpSweepR += aSweepR * (rawR[idx] - lpSweepR);
+            lpSubR += aSubR * (lpSweepR - lpSubR);
+
+            // Crisp high-altitude pine needle shimmer (~3.0 kHz)
+            float aShimmer = Mathf.Clamp(2f * Mathf.PI * 3000f / sampleRate, 0.03f, 0.48f);
+            bpShimmerL += aShimmer * (rawL[idx] - bpShimmerL);
+            bpShimmerR += aShimmer * (rawR[idx] - bpShimmerR);
+            float shimmerL = (rawL[idx] - bpShimmerL) * (0.08f + 0.14f * skyGustL);
+            float shimmerR = (rawR[idx] - bpShimmerR) * (0.08f + 0.14f * skyGustR);
+
+            if (pass >= 0)
+            {
+                float airyL = ((lpSweepL - lpSubL * 0.82f) * 0.9f + shimmerL) * skyGustL;
+                float airyR = ((lpSweepR - lpSubR * 0.82f) * 0.9f + shimmerR) * skyGustR;
+                stereoData[idx * 2]     = airyL;
+                stereoData[idx * 2 + 1] = airyR;
+            }
+        }
+
+        NormalizeStereoBuffer(stereoData, totalFrames, 0.40f);
+        AudioClip clip = AudioClip.Create("UpperOpenSkyWindLoop", totalFrames, 2, sampleRate, false);
         clip.SetData(stereoData, 0);
         return clip;
     }
@@ -4906,6 +5183,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         {
             int curX = x;
             int baselineY = y + 12; // Baseline inside the status/button line
+
             for (int i = 0; i < text.Length; i++)
             {
                 char ch = text[i];
@@ -4921,21 +5199,37 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 int glyphW = info.maxX - info.minX;
                 int glyphH = info.maxY - info.minY;
 
+                // Typography Baseline Alignment:
+                // Non-descender characters ('A'..'Z', '0'..'9', 'a','c','e','m','w','n','o','r','s','t','u','v','x','z', etc.)
+                // must ALWAYS have their bottom pixel row rest cleanly on `baselineY - 1`.
+                // Only true descenders ('g', 'j', 'p', 'q', 'y') extend below the baseline.
+                bool hasDescender = (ch == 'g' || ch == 'j' || ch == 'p' || ch == 'q' || ch == 'y');
+                int descenderDepth = hasDescender ? ((info.minY < 0) ? -info.minY : 3) : 0;
+                int bottomY = baselineY - 1 + descenderDepth;
+
                 if (glyphW > 0 && glyphH > 0)
                 {
                     for (int gy = 0; gy < glyphH; gy++)
                     {
-                        float v = Mathf.Lerp(info.uvTopRight.y, info.uvBottomLeft.y, (gy + 0.5f) / glyphH);
-                        int py = baselineY - info.maxY + gy;
+                        float normY = (gy + 0.5f) / glyphH;
+                        // Bottom row (gy == glyphH - 1) lands exactly on bottomY (baselineY - 1 for non-descenders)
+                        int py = bottomY - (glyphH - 1 - gy);
+                        if (!hasDescender && py >= baselineY)
+                            continue; // Hard safety: strictly forbid any non-descender pixel from extending below the baseline
 
                         for (int gx = 0; gx < glyphW; gx++)
                         {
-                            float u = Mathf.Lerp(info.uvBottomLeft.x, info.uvTopRight.x, (gx + 0.5f) / glyphW);
+                            float normX = (gx + 0.5f) / glyphW;
+                            // Bilinearly interpolate across all 4 CharacterInfo UV corners so wide glyphs
+                            // packed with 90-degree rotation in Unity's font atlas ('m', 'w') render upright!
+                            Vector2 uvTop = Vector2.Lerp(info.uvTopLeft, info.uvTopRight, normX);
+                            Vector2 uvBot = Vector2.Lerp(info.uvBottomLeft, info.uvBottomRight, normX);
+                            Vector2 uv = Vector2.Lerp(uvTop, uvBot, normY);
                             int px = curX + info.minX + gx;
 
-                            Color col = chicagoFontTextureCPU.GetPixelBilinear(u, v);
+                            Color col = chicagoFontTextureCPU.GetPixelBilinear(uv.x, uv.y);
                             float coverage = Mathf.Max(col.a, col.r);
-                            if (coverage > 0.40f)
+                            if (coverage > 0.42f)
                             {
                                 SetPixelFB(px, py, color);
                             }
