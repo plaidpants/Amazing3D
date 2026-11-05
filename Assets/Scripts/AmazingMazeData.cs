@@ -212,7 +212,8 @@ public class AmazingMazeData
 
             foreach (int dir in dirs)
             {
-                if (curIsRamp && (rampEntryMask & (1 << dir)) != 0) continue;
+                // Always force stairs/ramps to go straight through (exit direction must be opposite the ramp entry side)
+                if (curIsRamp && (rampEntryMask & (1 << DirOpp(dir))) == 0) continue;
                 var (nr, nc) = StepCoord(r, c, dir);
                 if (nr < 1 || nr > MaxRow || nc < 1 || nc > MaxCol) continue;
 
@@ -239,19 +240,9 @@ public class AmazingMazeData
                     nr > 1 && nr < MaxRow && nc > 1 && nc < MaxCol &&
                     IsCellCompletelyEmpty(nr, nc))
                 {
-                    bool canExitRamp = false;
-                    for (int ed = 0; ed < 4; ed++)
-                    {
-                        if (ed == DirOpp(dir)) continue;
-                        if (SkillLevel == 2 && ed != dir) continue;
-                        var after = StepCoord(nr, nc, ed);
-                        if (IsPlaneBaseFree(after.r, after.c, otherPlaneBase) ||
-                            FindSamePlaneBridgeMove(nr, nc, otherPlaneBase, ed) != null)
-                        {
-                            canExitRamp = true;
-                            break;
-                        }
-                    }
+                    var after = StepCoord(nr, nc, dir);
+                    bool canExitRamp = IsPlaneBaseFree(after.r, after.c, otherPlaneBase) ||
+                                       FindSamePlaneBridgeMove(nr, nc, otherPlaneBase, dir) != null;
 
                     if (canExitRamp)
                     {

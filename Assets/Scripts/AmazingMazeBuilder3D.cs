@@ -30,7 +30,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     [Header("Architecture & Maze Settings (Skill Level 1 = Level 2 Overpass Tunnels!)")]
     public WallArchitectureStyle architectureStyle = WallArchitectureStyle.FlatEdgedMac1Bit;
-    [Tooltip("0 = Level 1 (Flat), 1 = Level 2 (Non-Euclidean Archway Overpasses!), 2 = Level 3, 3 = Level 4")]
+    [Tooltip("0 = Level 1 (Flat), 1 = Level 2 (Non-Euclidean Archway Overpasses!), 2 = Level 3 (Upper Narrow + Stairs), 3 = Level 4 (Hard)")]
     [Range(0, 3)] public int skillLevel = 1;
     public float cellSize = 3.0f;
     public float wallHeight = 0.85f;
@@ -38,6 +38,14 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     public float tunnelArchHeight = 2.25f;
     public float wallThickness = 0.36f;
     [Range(0.01f, 0.08f)] public float blackEdgeOutlineWidth = 0.03f;
+
+    [Header("Upper Narrow Plane & Tapered Stairs (Skill Levels 2 & 3 = Maze Levels 3 & 4)")]
+    [Tooltip("Elevation of the upper narrow walkway plane (sits cleanly above lower archway roofs)")]
+    public float upperFloorY = 2.65f;
+    public float narrowCorridorWidth = 1.26f;
+    public float narrowWallThickness = 0.24f;
+    public float narrowWallHeight = 0.65f;
+    public float narrowTunnelArchHeight = 2.05f;
 
     [Header("Unoccupied Area Checkerboard Settings")]
     public bool fillUnoccupiedWithCheckerboard = true;
@@ -78,10 +86,17 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     private Material wristMapMaterial;
 
     private Dictionary<(int r, int c, int subLayer), GameObject[]> breadcrumbMeshes = new Dictionary<(int r, int c, int subLayer), GameObject[]>();
+    private Dictionary<(int r, int c), List<GameObject>> rampBreadcrumbMeshes = new Dictionary<(int r, int c), List<GameObject>>();
+    private Renderer startMarkerRenderer;
+    private Renderer endMarkerRenderer;
 
     private class BridgeCellInstance
     {
         public int r, c;
+        public int planeBaseLayer;
+        public float baseFloorY;
+        public float archHalfSpan;
+        public float archWallThick;
         public Vector3 worldCenter;
         public int nsSubLayer;
         public int ewSubLayer;
@@ -94,7 +109,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         public Material cellWallNS, cellFloorNS, cellCrumbNS, cellEdgeNS;
         public Material cellWallEW, cellFloorEW, cellCrumbEW, cellEdgeEW;
     }
-    private Dictionary<(int r, int c), BridgeCellInstance> bridgeCells = new Dictionary<(int r, int c), BridgeCellInstance>();
+    private Dictionary<(int r, int c, int planeBaseLayer), BridgeCellInstance> bridgeCells = new Dictionary<(int r, int c, int planeBaseLayer), BridgeCellInstance>();
     private List<BridgeCellInstance> sortedBridgeList = new List<BridgeCellInstance>();
 
     // Exact 1-bit QuickDraw Framebuffer
@@ -119,6 +134,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     // XRI Reflection caches
     private Type teleportAreaType;
     private object cachedTeleportProvider;
+    private CharacterController xrCharacterController;
+    private List<Collider> stairFloorColliders = new List<Collider>();
     private List<MonoBehaviour> moveProviders = new List<MonoBehaviour>();
     private List<MonoBehaviour> teleportRayInteractors = new List<MonoBehaviour>();
     private MethodInfo tryGetHitInfoMethod;
@@ -173,10 +190,45 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         else
             SpawnSimpleDesktopPlayer();
 
+        IgnoreStairFloorCollisionsForPlayer();
         ApplyMoveSpeedToXR();
         ConfigureCameraAndGlobalDither();
         UpdateNonEuclideanTunnelState();
         UpdateBreadcrumbsAnd2DMap();
+    }
+
+    void SetXRRigPositionAndSync(Vector3 newRigPos)
+    {
+        if (xrRigRoot == null) return;
+        bool wasEnabled = false;
+        if (xrCharacterController != null && xrCharacterController.enabled)
+        {
+            wasEnabled = true;
+            xrCharacterController.enabled = false;
+        }
+        xrRigRoot.position = newRigPos;
+        Physics.SyncTransforms();
+        if (wasEnabled)
+        {
+            xrCharacterController.enabled = true;
+        }
+    }
+
+    void IgnoreStairFloorCollisionsForPlayer()
+    {
+        CharacterController playerCC = xrCharacterController;
+        if (playerCC == null && activePlayerHeadOrBody != null)
+            playerCC = activePlayerHeadOrBody.GetComponent<CharacterController>();
+
+        if (playerCC == null) return;
+        playerCC.slopeLimit = 75f;
+        playerCC.stepOffset = 0.65f;
+
+        foreach (Collider col in stairFloorColliders)
+        {
+            if (col != null)
+                Physics.IgnoreCollision(col, playerCC, true);
+        }
     }
 
     void Update()
@@ -188,6 +240,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 ? WallArchitectureStyle.CycladicRounded
                 : WallArchitectureStyle.FlatEdgedMac1Bit;
             RebuildMazeGeometryOnly();
+            IgnoreStairFloorCollisionsForPlayer();
             UpdateNonEuclideanTunnelState();
             UpdateBreadcrumbsAnd2DMap();
         }
@@ -195,6 +248,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         {
             ToggleRunMode();
         }
+        if (Input.GetKeyDown(KeyCode.Alpha1)) SwitchToSkillLevel(0);
+        if (Input.GetKeyDown(KeyCode.Alpha2)) SwitchToSkillLevel(1);
+        if (Input.GetKeyDown(KeyCode.Alpha3)) SwitchToSkillLevel(2);
+        if (Input.GetKeyDown(KeyCode.Alpha4)) SwitchToSkillLevel(3);
 #endif
         if (activePlayerHeadOrBody == null) return;
 
@@ -213,6 +270,19 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             UpdateNonEuclideanTunnelState();
         }
 
+        // Keep VR rig elevation synced with current plane or tapered stair steps
+        if (xrRigRoot != null)
+        {
+            float targetFloorY = GetTargetPlayerFloorY(activePlayerHeadOrBody.position);
+            Vector3 rigPos = xrRigRoot.position;
+            float nextY = Mathf.Lerp(rigPos.y, targetFloorY + 0.02f, Mathf.Clamp01(Time.deltaTime * 18f));
+            if (Mathf.Abs(nextY - rigPos.y) > 0.0005f)
+            {
+                rigPos.y = nextY;
+                SetXRRigPositionAndSync(rigPos);
+            }
+        }
+
         UpdateBridgeRenderQueuesFrontToBack();
 
         float curYaw = activePlayerHeadOrBody.eulerAngles.y;
@@ -222,6 +292,117 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             lastPlayerYaw = curYaw;
             FlushFramebufferWithPlayerWedge();
         }
+    }
+
+    public void SwitchToSkillLevel(int newSkillLevel)
+    {
+        skillLevel = Mathf.Clamp(newSkillLevel, 0, 3);
+        lastBuiltSkillLevel = skillLevel;
+        MazeData.MakeMaze(skillLevel);
+        RebuildMazeGeometryOnly();
+        IgnoreStairFloorCollisionsForPlayer();
+        RepositionPlayerAtStart();
+        UpdateNonEuclideanTunnelState();
+        UpdateBreadcrumbsAnd2DMap();
+    }
+
+    void RepositionPlayerAtStart()
+    {
+        float startY = GetLayerBaseFloorY(MazeData.StartPos.layer);
+        byte startMask = MazeData.GetSquare(MazeData.StartPos.r, MazeData.StartPos.c, MazeData.StartPos.layer);
+        float startYaw = 0f;
+        if ((startMask & (1 << AmazingMazeData.DIR_RIGHT)) != 0) startYaw = 90f;
+        else if ((startMask & (1 << AmazingMazeData.DIR_DOWN)) != 0) startYaw = 180f;
+        else if ((startMask & (1 << AmazingMazeData.DIR_LEFT)) != 0) startYaw = -90f;
+
+        if (xrRigRoot != null)
+        {
+            Vector3 destWorld = CellToWorldCenter(MazeData.StartPos.r, MazeData.StartPos.c, startY + 0.02f);
+            Vector3 headOffset = (activePlayerHeadOrBody != null) ? (activePlayerHeadOrBody.position - xrRigRoot.position) : Vector3.zero;
+            headOffset.y = 0f;
+            SetXRRigPositionAndSync(destWorld - headOffset);
+            xrRigRoot.eulerAngles = new Vector3(0f, startYaw, 0f);
+        }
+        else if (activePlayerHeadOrBody != null)
+        {
+            CharacterController cc = activePlayerHeadOrBody.GetComponent<CharacterController>();
+            if (cc != null) cc.enabled = false;
+            activePlayerHeadOrBody.position = CellToWorldCenter(MazeData.StartPos.r, MazeData.StartPos.c, startY + 0.05f);
+            activePlayerHeadOrBody.eulerAngles = new Vector3(0f, startYaw, 0f);
+            Physics.SyncTransforms();
+            if (cc != null) cc.enabled = true;
+        }
+    }
+
+    public float GetLayerBaseFloorY(int subLayer)
+    {
+        return AmazingMazeData.IsWideSubLayer(subLayer) ? 0f : upperFloorY;
+    }
+
+    public static Vector3 DirToWorldVec(int dir)
+    {
+        switch (dir)
+        {
+            case AmazingMazeData.DIR_LEFT:  return new Vector3(-1f, 0f, 0f);
+            case AmazingMazeData.DIR_DOWN:  return new Vector3(0f, 0f, -1f);
+            case AmazingMazeData.DIR_RIGHT: return new Vector3(1f, 0f, 0f);
+            case AmazingMazeData.DIR_UP:    return new Vector3(0f, 0f, 1f);
+            default:                        return Vector3.forward;
+        }
+    }
+
+    public float GetTargetPlayerFloorY(Vector3 worldPos)
+    {
+        if (MazeData == null) return 0f;
+        int pr = MazeData.PlayerPos.r;
+        int pc = MazeData.PlayerPos.c;
+        var (curR, curC) = WorldToCell(worldPos);
+
+        int rampR = -1, rampC = -1;
+        if (MazeData.IsRamp(pr, pc))
+        {
+            rampR = pr;
+            rampC = pc;
+        }
+        else if (MazeData.IsRamp(curR, curC) && (Mathf.Abs(curR - pr) + Mathf.Abs(curC - pc) <= 1))
+        {
+            rampR = curR;
+            rampC = curC;
+        }
+
+        if (rampR != -1)
+        {
+            int wMask = MazeData.GetSquare(rampR, rampC, AmazingMazeData.LAYER_WIDE_BASE) & 0x0F;
+            int nMask = MazeData.GetSquare(rampR, rampC, AmazingMazeData.LAYER_NARROW_BASE) & 0x0F;
+            int wideDir = 0, narrowDir = 2;
+            for (int d = 0; d < 4; d++)
+            {
+                if ((wMask & (1 << d)) != 0) wideDir = d;
+                if ((nMask & (1 << d)) != 0) narrowDir = d;
+            }
+
+            Vector3 rel = worldPos - CellToWorldCenter(rampR, rampC, 0f);
+            float halfCell = cellSize * 0.5f;
+            Vector3 vecW = DirToWorldVec(wideDir);
+            Vector3 vecN = DirToWorldVec(narrowDir);
+
+            if (narrowDir == AmazingMazeData.DirOpp(wideDir))
+            {
+                float distAlongNarrow = Vector3.Dot(rel, vecN);
+                float t = Mathf.Clamp01((distAlongNarrow + halfCell) / cellSize);
+                return t * upperFloorY;
+            }
+            else
+            {
+                float u = Vector3.Dot(rel, vecW);
+                float v = Vector3.Dot(rel, vecN);
+                float p1 = Mathf.Clamp01((halfCell - u) / halfCell) * 0.5f;
+                float p2 = Mathf.Clamp01(v / halfCell) * 0.5f;
+                return Mathf.Clamp01(p1 + p2) * upperFloorY;
+            }
+        }
+
+        return GetLayerBaseFloorY(MazeData.PlayerPos.layer);
     }
 
     public void ToggleRunMode()
@@ -240,6 +421,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             Type t = mp.GetType();
             PropertyInfo p = t.GetProperty("moveSpeed", BindingFlags.Public | BindingFlags.Instance);
             p?.SetValue(mp, targetSpeed);
+
+            // Disable built-in gravity so XRI does not fight stair & upper-plane elevation tracking
+            PropertyInfo gravProp = t.GetProperty("useGravity", BindingFlags.Public | BindingFlags.Instance);
+            gravProp?.SetValue(mp, false);
         }
     }
 
@@ -314,6 +499,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         int pr = MazeData.PlayerPos.r;
         int pc = MazeData.PlayerPos.c;
         int pLayer = MazeData.PlayerPos.layer;
+        int playerPlaneBase = AmazingMazeData.BaseLayerOfPlane(pLayer);
 
         sortedBridgeList.Clear();
         foreach (var kvp in bridgeCells)
@@ -326,22 +512,22 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             return da.CompareTo(db);
         });
 
-        float portalOuterDist = cellSize * 0.5f + wallThickness * 0.5f;
-        // Switch to inside-tunnel rendering 0.28m BEFORE the camera's near clip plane touches the outer portal quad!
-        float thresholdDist = portalOuterDist + 0.28f;
-        float corridorHalfWidth = (cellSize - wallThickness) * 0.5f + 0.15f;
-
         for (int i = 0; i < sortedBridgeList.Count; i++)
         {
             BridgeCellInstance br = sortedBridgeList[i];
             float absDX = Mathf.Abs(camPos.x - br.worldCenter.x);
             float absDZ = Mathf.Abs(camPos.z - br.worldCenter.z);
 
-            bool inCellGrid = (pr == br.r && pc == br.c);
-            bool atNSThreshold = (absDX <= corridorHalfWidth && absDZ <= thresholdDist);
-            bool atEWThreshold = (absDZ <= corridorHalfWidth && absDX <= thresholdDist);
+            float portalOuterDist = br.archHalfSpan + br.archWallThick * 0.5f;
+            float thresholdDist = portalOuterDist + 0.28f;
+            float corridorHalfWidth = (br.archHalfSpan - br.archWallThick * 0.5f) + 0.15f;
 
-            // Check if the player is inside the bridge OR standing right at its active entrance threshold
+            bool onSamePlane = (playerPlaneBase == br.planeBaseLayer);
+            bool inCellGrid = onSamePlane && (pr == br.r && pc == br.c);
+            bool atNSThreshold = onSamePlane && (absDX <= corridorHalfWidth && absDZ <= thresholdDist);
+            bool atEWThreshold = onSamePlane && (absDZ <= corridorHalfWidth && absDX <= thresholdDist);
+
+            // Check if the player is inside the bridge OR standing right at its active entrance threshold on the same plane
             bool activeIsNS = (inCellGrid) ? (pLayer == br.nsSubLayer) : (absDZ >= absDX);
             bool playerInsideOrAtThreshold = inCellGrid || (activeIsNS && atNSThreshold) || (!activeIsNS && atEWThreshold);
 
@@ -428,7 +614,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             BridgeCellInstance br = kvp.Value;
             bool enableNSColliders;
 
-            if (pr == br.r && pc == br.c)
+            if (pr == br.r && pc == br.c && AmazingMazeData.BaseLayerOfPlane(pLayer) == br.planeBaseLayer)
             {
                 enableNSColliders = (pLayer == br.nsSubLayer);
             }
@@ -585,11 +771,12 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                     Vector3 hitNormal = (Vector3)args[1];
 
                     var (hitR, hitC) = WorldToCell(hitPos);
-                    bool isFloorHit = hitNormal.y > 0.7f;
-                    bool isLegalCorridorJump = isFloorHit &&
-                                               IsLegalStraightCorridorTeleport(hitR, hitC, out int clampedR, out int clampedC) &&
+                    bool isFloorOrStairHit = hitNormal.y > 0.45f;
+
+                    bool isLegalCorridorJump = isFloorOrStairHit &&
+                                               IsLegalStraightCorridorTeleport(hitR, hitC, hitPos.y, out int clampedR, out int clampedC) &&
                                                (clampedR == hitR && clampedC == hitC) &&
-                                               !(hitR == MazeData.PlayerPos.r && hitC == MazeData.PlayerPos.c);
+                                               (!(hitR == MazeData.PlayerPos.r && hitC == MazeData.PlayerPos.c) || MazeData.IsRamp(hitR, hitC));
 
                     if (isLegalCorridorJump)
                     {
@@ -597,7 +784,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                         pendingTeleportWorldHit = hitPos;
 
                         SetTeleportRayVisualColor(rayInteractor.gameObject, true);
-                        teleportReticleObj.transform.position = new Vector3(hitPos.x, 0.025f, hitPos.z);
+                        teleportReticleObj.transform.position = new Vector3(hitPos.x, hitPos.y + 0.025f, hitPos.z);
                         teleportReticleObj.transform.rotation = Quaternion.Euler(90f, 0f, 0f);
                         teleportReticleRenderer.sharedMaterial.mainTexture = validTargetTex;
                         showReticleThisFrame = true;
@@ -631,14 +818,24 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             hasValidPendingTeleportHit = false;
             var (targetR, targetC) = WorldToCell(pendingTeleportWorldHit);
 
-            if (IsLegalStraightCorridorTeleport(targetR, targetC, out int clampedR, out int clampedC))
+            if (IsLegalStraightCorridorTeleport(targetR, targetC, pendingTeleportWorldHit.y, out int clampedR, out int clampedC))
             {
-                Vector3 destWorld = CellToWorldCenter(clampedR, clampedC, xrRigRoot.position.y);
+                StepPlayerTowardCell(clampedR, clampedC);
+                Vector3 destWorld;
+                if (MazeData.IsRamp(clampedR, clampedC))
+                {
+                    float stairY = GetTargetPlayerFloorY(pendingTeleportWorldHit);
+                    destWorld = new Vector3(pendingTeleportWorldHit.x, stairY + 0.02f, pendingTeleportWorldHit.z);
+                }
+                else
+                {
+                    float destFloorY = GetLayerBaseFloorY(MazeData.PlayerPos.layer);
+                    destWorld = CellToWorldCenter(clampedR, clampedC, destFloorY + 0.02f);
+                }
                 Vector3 headOffset = activePlayerHeadOrBody.position - xrRigRoot.position;
                 headOffset.y = 0f;
-                xrRigRoot.position = destWorld - headOffset;
+                SetXRRigPositionAndSync(destWorld - headOffset);
 
-                StepPlayerTowardCell(clampedR, clampedC);
                 UpdateNonEuclideanTunnelState();
             }
         }
@@ -650,7 +847,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         wasTeleportRayActiveLastFrame = anyTeleportRayActive;
     }
 
-    bool IsLegalStraightCorridorTeleport(int targetR, int targetC, out int clampedR, out int clampedC)
+    bool IsLegalStraightCorridorTeleport(int targetR, int targetC, float hitY, out int clampedR, out int clampedC)
     {
         clampedR = MazeData.PlayerPos.r;
         clampedC = MazeData.PlayerPos.c;
@@ -662,7 +859,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             return false;
 
         if (dr == 0 && dc == 0)
-            return true;
+        {
+            if (MazeData.IsRamp(clampedR, clampedC)) return true;
+            return Mathf.Abs(hitY - GetLayerBaseFloorY(MazeData.PlayerPos.layer)) < 0.60f;
+        }
 
         int dir = -1;
         int dist = Mathf.Abs(dr) + Mathf.Abs(dc);
@@ -682,9 +882,19 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         {
             var stepOpt = MazeData.CanMove(simR, simC, simLayer, dir);
             if (!stepOpt.HasValue) return false;
+
             simR = stepOpt.Value.r;
             simC = stepOpt.Value.c;
             simLayer = stepOpt.Value.layer;
+        }
+
+        // Anti-cheat check: if the destination cell is not a stair cell, its hit elevation MUST match the plane
+        // reached by legally stepping through CanMove (prevents jumping from upper narrow path down into lower maze!)
+        if (!MazeData.IsRamp(simR, simC))
+        {
+            float expectedTargetY = GetLayerBaseFloorY(simLayer);
+            if (Mathf.Abs(hitY - expectedTargetY) > 0.60f)
+                return false;
         }
 
         clampedR = simR;
@@ -744,12 +954,24 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         if (MazeData.PlayerPos.r != targetR || MazeData.PlayerPos.c != targetC)
         {
+            Vector3 legalCellCenter = CellToWorldCenter(MazeData.PlayerPos.r, MazeData.PlayerPos.c, 0f);
+            float legalY = MazeData.IsRamp(MazeData.PlayerPos.r, MazeData.PlayerPos.c)
+                ? GetTargetPlayerFloorY(legalCellCenter)
+                : GetLayerBaseFloorY(MazeData.PlayerPos.layer);
             if (xrRigRoot != null)
             {
-                Vector3 legalWorldPos = CellToWorldCenter(MazeData.PlayerPos.r, MazeData.PlayerPos.c, xrRigRoot.position.y);
+                Vector3 legalWorldPos = CellToWorldCenter(MazeData.PlayerPos.r, MazeData.PlayerPos.c, legalY + 0.02f);
                 Vector3 headOffset = activePlayerHeadOrBody.position - xrRigRoot.position;
                 headOffset.y = 0f;
-                xrRigRoot.position = legalWorldPos - headOffset;
+                SetXRRigPositionAndSync(legalWorldPos - headOffset);
+            }
+            else if (activePlayerHeadOrBody != null)
+            {
+                CharacterController cc = activePlayerHeadOrBody.GetComponent<CharacterController>();
+                if (cc != null) cc.enabled = false;
+                activePlayerHeadOrBody.position = CellToWorldCenter(MazeData.PlayerPos.r, MazeData.PlayerPos.c, legalY + 0.05f);
+                Physics.SyncTransforms();
+                if (cc != null) cc.enabled = true;
             }
         }
 
@@ -790,6 +1012,12 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     {
         teleportRayInteractors.Clear();
         moveProviders.Clear();
+        xrCharacterController = xrRigRoot.GetComponentInChildren<CharacterController>(true);
+        if (xrCharacterController != null)
+        {
+            xrCharacterController.slopeLimit = 75f;
+            xrCharacterController.stepOffset = 0.65f;
+        }
 
         foreach (MonoBehaviour mb in xrRigRoot.GetComponentsInChildren<MonoBehaviour>(true))
         {
@@ -1165,15 +1393,25 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         return (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BRIDGE) & 0x0F) != 0;
     }
 
+    bool IsNarrowBridgeCell(int r, int c)
+    {
+        if (r < 1 || r > MazeData.MaxRow || c < 1 || c > MazeData.MaxCol) return false;
+        return (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BRIDGE) & 0x0F) != 0;
+    }
+
     /* ============================================================================
      * 3D MAZE GEOMETRY BUILDER (SEAMLESS ARCHWAYS + DUAL STENCIL PORTAL TUNNELS)
      * ============================================================================ */
     public void RebuildMazeGeometryOnly()
     {
+        // Ensure upper narrow walkway (including its 0.12m floor slab thickness) always sits cleanly above lower archway roofs and edge bars
+        upperFloorY = Mathf.Max(upperFloorY, tunnelArchHeight + 0.25f);
         lastBuiltStyle = architectureStyle;
         if (mazeRoot != null) Destroy(mazeRoot);
         mazeRoot = new GameObject("MazeGeometryRoot");
         breadcrumbMeshes.Clear();
+        rampBreadcrumbMeshes.Clear();
+        stairFloorColliders.Clear();
         bridgeCells.Clear();
 
         InitFramebuffer(
@@ -1191,9 +1429,19 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             for (int c = minC; c <= maxC; c++)
             {
                 bool insideGrid = (r >= 1 && r <= MazeData.MaxRow && c >= 1 && c <= MazeData.MaxCol);
+                bool isRampCell = insideGrid && MazeData.IsRamp(r, c);
                 int wBaseOpen   = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BASE) & 0x0F) : 0;
                 int wBridgeOpen = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BRIDGE) & 0x0F) : 0;
+                int nBaseOpen   = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BASE) & 0x0F) : 0;
+                int nBridgeOpen = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BRIDGE) & 0x0F) : 0;
 
+                if (isRampCell)
+                {
+                    BuildTaperedRampStairsCell(r, c, wBaseOpen, nBaseOpen);
+                    continue;
+                }
+
+                // 1. LOWER WIDE PLANE (y = 0m)
                 if (wBaseOpen == 0 && wBridgeOpen == 0)
                 {
                     if (fillUnoccupiedWithCheckerboard)
@@ -1201,13 +1449,23 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 }
                 else if (wBridgeOpen != 0)
                 {
-                    BuildSimultaneousNonEuclideanBridgeCell(r, c, wBaseOpen, wBridgeOpen);
+                    BuildSimultaneousNonEuclideanBridgeCell(r, c, wBaseOpen, wBridgeOpen, isNarrowPlane: false);
                 }
                 else
                 {
                     BuildWideCellFloorAndBreadcrumbs(mazeRoot.transform, r, c, AmazingMazeData.LAYER_WIDE_BASE, whiteFloorMaterial, blackBreadcrumbMaterial, true);
                     if (architectureStyle == WallArchitectureStyle.CycladicRounded)
                         BuildCycladicCellWalls(r, c, wBaseOpen);
+                }
+
+                // 2. UPPER NARROW PLANE (y = upperFloorY)
+                if (nBridgeOpen != 0)
+                {
+                    BuildSimultaneousNonEuclideanBridgeCell(r, c, nBaseOpen, nBridgeOpen, isNarrowPlane: true);
+                }
+                else if (nBaseOpen != 0)
+                {
+                    BuildUpperNarrowCorridorCell(r, c, nBaseOpen);
                 }
             }
         }
@@ -1217,68 +1475,80 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             BuildSeamlessFlatWallsWithPhysicalOutlines();
         }
 
-        float markerY = Mathf.Max(0.55f, wallHeight * 0.65f);
-        SpawnMarkerPrimitive(PrimitiveType.Sphere, MazeData.StartPos.r, MazeData.StartPos.c, markerY, "StartSphere_Marker");
-        SpawnMarkerPrimitive(PrimitiveType.Cube, MazeData.EndPos.r, MazeData.EndPos.c, markerY, "GoalCube_Marker");
+        float markerOffsetY = Mathf.Max(0.55f, wallHeight * 0.65f);
+        float startY = GetLayerBaseFloorY(MazeData.StartPos.layer) + markerOffsetY;
+        float endY   = GetLayerBaseFloorY(MazeData.EndPos.layer) + markerOffsetY;
+        startMarkerRenderer = SpawnMarkerPrimitive(PrimitiveType.Sphere, MazeData.StartPos.r, MazeData.StartPos.c, startY, "StartSphere_Marker");
+        endMarkerRenderer   = SpawnMarkerPrimitive(PrimitiveType.Cube, MazeData.EndPos.r, MazeData.EndPos.c, endY, "GoalCube_Marker");
     }
 
-    void BuildSimultaneousNonEuclideanBridgeCell(int r, int c, int wBaseOpen, int wBridgeOpen)
+    void BuildSimultaneousNonEuclideanBridgeCell(int r, int c, int baseOpenMask, int bridgeOpenMask, bool isNarrowPlane)
     {
-        Vector3 center = CellToWorldCenter(r, c, 0f);
-        GameObject bridgeRoot = new GameObject($"NonEuclideanBridgeCell_{r}_{c}");
+        float baseFloorY = isNarrowPlane ? upperFloorY : 0f;
+        int planeBaseLayer = isNarrowPlane ? AmazingMazeData.LAYER_NARROW_BASE : AmazingMazeData.LAYER_WIDE_BASE;
+        int planeBridgeLayer = isNarrowPlane ? AmazingMazeData.LAYER_NARROW_BRIDGE : AmazingMazeData.LAYER_WIDE_BRIDGE;
+
+        Vector3 center = CellToWorldCenter(r, c, baseFloorY);
+        string prefix = isNarrowPlane ? "UpperNarrowBridgeCell" : "NonEuclideanBridgeCell";
+        GameObject bridgeRoot = new GameObject($"{prefix}_{r}_{c}");
         bridgeRoot.transform.SetParent(mazeRoot.transform, false);
         bridgeRoot.transform.position = center;
+
+        float wt = isNarrowPlane ? narrowWallThickness : wallThickness;
+        float halfWT = wt * 0.5f;
+        float innerSpan = isNarrowPlane ? narrowCorridorWidth : (cellSize - wt);
+        float half = (innerSpan + wt) * 0.5f;
+        float th = isNarrowPlane ? narrowTunnelArchHeight : tunnelArchHeight;
+        float roofThick = isNarrowPlane ? 0.20f : 0.24f;
+        float doorH = th - roofThick;
+        float fullTunnelLen = innerSpan + 2f * wt;
+        float ew = blackEdgeOutlineWidth;
 
         GameObject baseColliderFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
         baseColliderFloor.name = "BridgeTeleportFloor";
         baseColliderFloor.transform.SetParent(bridgeRoot.transform, false);
-        baseColliderFloor.transform.localPosition = new Vector3(0f, -0.052f, 0f);
-        Vector3 floorScale = new Vector3(cellSize, 0.1f, cellSize);
+        float floorSlabThick = isNarrowPlane ? 0.08f : 0.1f;
+        baseColliderFloor.transform.localPosition = new Vector3(0f, -(floorSlabThick * 0.5f + 0.002f), 0f);
+        Vector3 floorScale = isNarrowPlane ? new Vector3(fullTunnelLen, floorSlabThick, fullTunnelLen) : new Vector3(cellSize, floorSlabThick, cellSize);
         baseColliderFloor.transform.localScale = floorScale;
         NormalizeMeshUVsToWorldSpacePosition(baseColliderFloor, PrimitiveType.Cube, center + new Vector3(0f, -0.052f, 0f), floorScale);
         baseColliderFloor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
         ConfigureFloorTeleportationArea(baseColliderFloor);
 
-        bool baseIsNS = (wBaseOpen & ((1 << AmazingMazeData.DIR_UP) | (1 << AmazingMazeData.DIR_DOWN))) != 0;
-        int nsSubLayer = baseIsNS ? AmazingMazeData.LAYER_WIDE_BASE : AmazingMazeData.LAYER_WIDE_BRIDGE;
-        int ewSubLayer = baseIsNS ? AmazingMazeData.LAYER_WIDE_BRIDGE : AmazingMazeData.LAYER_WIDE_BASE;
+        bool baseIsNS = (baseOpenMask & ((1 << AmazingMazeData.DIR_UP) | (1 << AmazingMazeData.DIR_DOWN))) != 0;
+        int nsSubLayer = baseIsNS ? planeBaseLayer : planeBridgeLayer;
+        int ewSubLayer = baseIsNS ? planeBridgeLayer : planeBaseLayer;
 
         int bridgeIndex = bridgeCells.Count;
         int nsStencilRef = ((bridgeIndex * 2) % 250) + 1;
         int ewStencilRef = nsStencilRef + 1;
 
-        float half = cellSize * 0.5f;
-        float wt = wallThickness;
-        float halfWT = wt * 0.5f;
-        float th = tunnelArchHeight;
-        float roofThick = 0.24f;
-        float doorH = th - roofThick;
-        float innerSpan = cellSize - wt;
-        float fullTunnelLen = cellSize + wt;
-        float ew = blackEdgeOutlineWidth;
-
         var brInfo = new BridgeCellInstance
         {
             r = r,
             c = c,
+            planeBaseLayer = planeBaseLayer,
+            baseFloorY = baseFloorY,
+            archHalfSpan = half,
+            archWallThick = wt,
             worldCenter = center,
             nsSubLayer = nsSubLayer,
             ewSubLayer = ewSubLayer,
-            cellPortalNS = new Material(portalMaskNS_Mat) { name = $"PortalNS_{r}_{c}_Ref{nsStencilRef}" },
-            cellPortalEW = new Material(portalMaskEW_Mat) { name = $"PortalEW_{r}_{c}_Ref{ewStencilRef}" },
-            cellWallNS = CreateStencilClone(whiteWallMaterial, $"WallNS_{r}_{c}", nsStencilRef),
-            cellFloorNS = CreateStencilClone(whiteFloorMaterial, $"FloorNS_{r}_{c}", nsStencilRef),
-            cellCrumbNS = CreateStencilClone(blackBreadcrumbMaterial, $"CrumbNS_{r}_{c}", nsStencilRef),
-            cellEdgeNS = CreateStencilClone(blackEdgeMaterial, $"EdgeNS_{r}_{c}", nsStencilRef),
-            cellWallEW = CreateStencilClone(whiteWallMaterial, $"WallEW_{r}_{c}", ewStencilRef),
-            cellFloorEW = CreateStencilClone(whiteFloorMaterial, $"FloorEW_{r}_{c}", ewStencilRef),
-            cellCrumbEW = CreateStencilClone(blackBreadcrumbMaterial, $"CrumbEW_{r}_{c}", ewStencilRef),
-            cellEdgeEW = CreateStencilClone(blackEdgeMaterial, $"EdgeEW_{r}_{c}", ewStencilRef)
+            cellPortalNS = new Material(portalMaskNS_Mat) { name = $"PortalNS_{r}_{c}_P{planeBaseLayer}_Ref{nsStencilRef}" },
+            cellPortalEW = new Material(portalMaskEW_Mat) { name = $"PortalEW_{r}_{c}_P{planeBaseLayer}_Ref{ewStencilRef}" },
+            cellWallNS = CreateStencilClone(whiteWallMaterial, $"WallNS_{r}_{c}_P{planeBaseLayer}", nsStencilRef),
+            cellFloorNS = CreateStencilClone(whiteFloorMaterial, $"FloorNS_{r}_{c}_P{planeBaseLayer}", nsStencilRef),
+            cellCrumbNS = CreateStencilClone(blackBreadcrumbMaterial, $"CrumbNS_{r}_{c}_P{planeBaseLayer}", nsStencilRef),
+            cellEdgeNS = CreateStencilClone(blackEdgeMaterial, $"EdgeNS_{r}_{c}_P{planeBaseLayer}", nsStencilRef),
+            cellWallEW = CreateStencilClone(whiteWallMaterial, $"WallEW_{r}_{c}_P{planeBaseLayer}", ewStencilRef),
+            cellFloorEW = CreateStencilClone(whiteFloorMaterial, $"FloorEW_{r}_{c}_P{planeBaseLayer}", ewStencilRef),
+            cellCrumbEW = CreateStencilClone(blackBreadcrumbMaterial, $"CrumbEW_{r}_{c}_P{planeBaseLayer}", ewStencilRef),
+            cellEdgeEW = CreateStencilClone(blackEdgeMaterial, $"EdgeEW_{r}_{c}_P{planeBaseLayer}", ewStencilRef)
         };
         brInfo.cellPortalNS.SetInt("_StencilRef", nsStencilRef);
         brInfo.cellPortalEW.SetInt("_StencilRef", ewStencilRef);
 
-        bridgeCells[(r, c)] = brInfo;
+        bridgeCells[(r, c, planeBaseLayer)] = brInfo;
 
         // 1. Outward-Facing Stencil Portal Windows at the outer face of the archway (`half + halfWT`)
         float outerPortalDist = half + halfWT;
@@ -1287,8 +1557,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_East_Ref{ewStencilRef}", new Vector3(outerPortalDist, doorH * 0.5f, 0f), new Vector3(innerSpan, doorH, 1f), Quaternion.Euler(0f, -90f, 0f), brInfo.cellPortalEW));
         brInfo.portalQuads.Add(CreatePortalQuad(bridgeRoot.transform, $"Portal_West_Ref{ewStencilRef}", new Vector3(-outerPortalDist, doorH * 0.5f, 0f), new Vector3(innerSpan, doorH, 1f), Quaternion.Euler(0f, 90f, 0f), brInfo.cellPortalEW));
 
-        // 2. Cycladic Pillars & Roof (FlatEdgedMac1Bit pillars & outlines are built in BuildSeamlessFlatWallsWithPhysicalOutlines
-        //    using exact hWall/vWall topology so there are ZERO flickering seams or missing green-oval segments!)
+        // 2. Pillars & Roof
         if (architectureStyle == WallArchitectureStyle.CycladicRounded)
         {
             for (int sx = -1; sx <= 1; sx += 2)
@@ -1306,12 +1575,12 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                     post.GetComponent<Renderer>().sharedMaterial = whiteWallMaterial;
                 }
             }
-            BuildCycladicCrossVaultRoof(bridgeRoot.transform, center, th, innerSpan, cellSize + wt);
+            BuildCycladicCrossVaultRoof(bridgeRoot.transform, center, th, innerSpan, fullTunnelLen);
         }
         else
         {
             // Flat-Edged Roof Slab
-            float fullWidth = cellSize + wt;
+            float fullWidth = fullTunnelLen;
             Vector3 roofCenter = center + new Vector3(0f, th - roofThick * 0.5f, 0f);
             Vector3 roofScale = new Vector3(fullWidth, roofThick, fullWidth);
             CreateWallBoxWithMaterial(bridgeRoot.transform, "SharedArchRoof", roofCenter, roofScale, whiteWallMaterial);
@@ -1328,20 +1597,110 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             CreateBlackEdgeBarWithMaterial(bridgeRoot.transform, center + new Vector3(0f, doorH, -(half + halfWT)), new Vector3(innerSpan + ew, ew, ew), blackEdgeMaterial);
             CreateBlackEdgeBarWithMaterial(bridgeRoot.transform, center + new Vector3(half + halfWT, doorH, 0f), new Vector3(ew, ew, innerSpan + ew), blackEdgeMaterial);
             CreateBlackEdgeBarWithMaterial(bridgeRoot.transform, center + new Vector3(-(half + halfWT), doorH, 0f), new Vector3(ew, ew, innerSpan + ew), blackEdgeMaterial);
+
+            if (isNarrowPlane)
+            {
+                BuildUpperNarrowBridgePillarsAndApproachArms(bridgeRoot.transform, center, half, wt, doorH, th, innerSpan);
+            }
+        }
+
+        if (isNarrowPlane && architectureStyle == WallArchitectureStyle.CycladicRounded)
+        {
+            BuildUpperNarrowBridgePillarsAndApproachArms(bridgeRoot.transform, center, half, wt, doorH, th, innerSpan);
         }
 
         // 3. Build NORTH-SOUTH Tunnel Interior (Inset by 0.004m so it sits cleanly in front of the pillar inner face with ZERO z-fighting!)
-        BuildTunnelStencilFloorAndBreadcrumbs(bridgeRoot.transform, r, c, nsSubLayer, brInfo.cellFloorNS, brInfo.cellCrumbNS);
-        BuildInwardStencilTunnelWalls(bridgeRoot.transform, center, alongZ: true, doorH, innerSpan - 0.008f, fullTunnelLen, brInfo.cellWallNS, brInfo.cellEdgeNS, brInfo.nsWallColliders);
+        BuildTunnelStencilFloorAndBreadcrumbs(bridgeRoot.transform, r, c, nsSubLayer, baseFloorY, fullTunnelLen, isNarrowPlane, brInfo.cellFloorNS, brInfo.cellCrumbNS);
+        BuildInwardStencilTunnelWalls(bridgeRoot.transform, center, alongZ: true, doorH, innerSpan - 0.008f, fullTunnelLen, wt, brInfo.cellWallNS, brInfo.cellEdgeNS, brInfo.nsWallColliders);
 
         // 4. Build EAST-WEST Tunnel Interior (Inset by 0.004m so it sits cleanly in front of the pillar inner face with ZERO z-fighting!)
-        BuildTunnelStencilFloorAndBreadcrumbs(bridgeRoot.transform, r, c, ewSubLayer, brInfo.cellFloorEW, brInfo.cellCrumbEW);
-        BuildInwardStencilTunnelWalls(bridgeRoot.transform, center, alongZ: false, doorH, innerSpan - 0.008f, fullTunnelLen, brInfo.cellWallEW, brInfo.cellEdgeEW, brInfo.ewWallColliders);
+        BuildTunnelStencilFloorAndBreadcrumbs(bridgeRoot.transform, r, c, ewSubLayer, baseFloorY, fullTunnelLen, isNarrowPlane, brInfo.cellFloorEW, brInfo.cellCrumbEW);
+        BuildInwardStencilTunnelWalls(bridgeRoot.transform, center, alongZ: false, doorH, innerSpan - 0.008f, fullTunnelLen, wt, brInfo.cellWallEW, brInfo.cellEdgeEW, brInfo.ewWallColliders);
     }
 
-    void BuildTunnelStencilFloorAndBreadcrumbs(Transform parent, int r, int c, int subLayer, Material stencilFloorMat, Material stencilCrumbMat)
+    void BuildUpperNarrowBridgePillarsAndApproachArms(Transform parent, Vector3 center, float half, float nwt, float doorH, float th, float innerSpan)
     {
-        Vector3 center = CellToWorldCenter(r, c, 0f);
+        float halfWT = nwt * 0.5f;
+        float outerHW = half + halfWT;
+        float halfCell = cellSize * 0.5f;
+        float armLen = Mathf.Max(0.05f, halfCell - outerHW);
+        float armMid = outerHW + armLen * 0.5f;
+        float nwh = narrowWallHeight;
+        float ew = blackEdgeOutlineWidth;
+        float floorThick = 0.08f;
+
+        if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+        {
+            for (int sx = -1; sx <= 1; sx += 2)
+            {
+                for (int sz = -1; sz <= 1; sz += 2)
+                {
+                    Vector3 pPos = center + new Vector3(sx * half, 0f, sz * half);
+                    CreateWallBoxWithMaterial(parent, $"NarrowArchPillar_{sx}_{sz}", pPos + new Vector3(0f, doorH * 0.5f, 0f), new Vector3(nwt, doorH, nwt), whiteWallMaterial);
+
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(0f, nwh, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, nwh, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
+
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(0f, ew * 0.5f, -sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(-sx * halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
+
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, th * 0.5f, sz * halfWT), new Vector3(ew, th + ew, ew), blackEdgeMaterial);
+
+                    float jambSegH = doorH - nwh;
+                    float jambMidY = nwh + jambSegH * 0.5f;
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, jambMidY, -sz * halfWT), new Vector3(ew, jambSegH + ew, ew), blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(-sx * halfWT, jambMidY, sz * halfWT), new Vector3(ew, jambSegH + ew, ew), blackEdgeMaterial);
+                }
+            }
+        }
+
+        for (int dir = 0; dir < 4; dir++)
+        {
+            bool alongZ = (dir == AmazingMazeData.DIR_UP || dir == AmazingMazeData.DIR_DOWN);
+            float sign = (dir == AmazingMazeData.DIR_UP || dir == AmazingMazeData.DIR_RIGHT) ? 1f : -1f;
+
+            Vector3 armCenter = center + (alongZ ? new Vector3(0f, 0f, sign * armMid) : new Vector3(sign * armMid, 0f, 0f));
+            Vector3 fScale = alongZ ? new Vector3(outerHW * 2f, floorThick, armLen) : new Vector3(armLen, floorThick, outerHW * 2f);
+
+            GameObject armFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            armFloor.name = $"NarrowBridgeApproachFloor_{dir}";
+            armFloor.transform.SetParent(parent, false);
+            armFloor.transform.position = armCenter + new Vector3(0f, -floorThick * 0.5f, 0f);
+            armFloor.transform.localScale = fScale;
+            NormalizeMeshUVsToWorldSpacePosition(armFloor, PrimitiveType.Cube, armFloor.transform.position, fScale);
+            armFloor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
+            ConfigureFloorTeleportationArea(armFloor);
+
+            for (int side = -1; side <= 1; side += 2)
+            {
+                Vector3 wallPos = armCenter + (alongZ ? new Vector3(side * half, nwh * 0.5f, 0f) : new Vector3(0f, nwh * 0.5f, side * half));
+                Vector3 wallScale = alongZ ? new Vector3(nwt, nwh, armLen) : new Vector3(armLen, nwh, nwt);
+                CreateWallBoxWithMaterial(parent, "NarrowApproachWall", wallPos, wallScale, whiteWallMaterial);
+
+                Vector3 colPos = armCenter + (alongZ ? new Vector3(side * half, 1.5f, 0f) : new Vector3(0f, 1.5f, side * half));
+                CreateTunnelCollider(parent, "NarrowApproachCol", colPos, alongZ ? new Vector3(nwt, 3.0f, armLen) : new Vector3(armLen, 3.0f, nwt));
+
+                if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                {
+                    for (int fSide = -1; fSide <= 1; fSide += 2)
+                    {
+                        Vector3 topBar = armCenter + (alongZ ? new Vector3(side * half + fSide * halfWT, nwh, 0f) : new Vector3(0f, nwh, side * half + fSide * halfWT));
+                        Vector3 botBar = armCenter + (alongZ ? new Vector3(side * half + fSide * halfWT, ew * 0.5f, 0f) : new Vector3(0f, ew * 0.5f, side * half + fSide * halfWT));
+                        Vector3 barScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
+                        CreateBlackEdgeBarWithMaterial(parent, topBar, barScale, blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(parent, botBar, barScale, blackEdgeMaterial);
+                    }
+                    Vector3 underBar = armCenter + (alongZ ? new Vector3(side * outerHW, -floorThick, 0f) : new Vector3(0f, -floorThick, side * outerHW));
+                    Vector3 underScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
+                    CreateBlackEdgeBarWithMaterial(parent, underBar, underScale, blackEdgeMaterial);
+                }
+            }
+        }
+    }
+
+    void BuildTunnelStencilFloorAndBreadcrumbs(Transform parent, int r, int c, int subLayer, float baseFloorY, float tunnelFloorSpan, bool isNarrowPlane, Material stencilFloorMat, Material stencilCrumbMat)
+    {
+        Vector3 center = CellToWorldCenter(r, c, baseFloorY);
         GameObject cellObj = new GameObject($"TunnelFloorAndCrumbs_{r}_{c}_Sub{subLayer}");
         cellObj.transform.SetParent(parent, false);
         cellObj.transform.position = center;
@@ -1352,29 +1711,69 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         floorQuad.transform.SetParent(cellObj.transform, false);
         floorQuad.transform.localPosition = new Vector3(0f, 0.002f, 0f);
         floorQuad.transform.localRotation = Quaternion.Euler(90f, 0f, 0f);
-        Vector3 fScale = new Vector3(cellSize + wallThickness, cellSize + wallThickness, 1f);
+        Vector3 fScale = new Vector3(tunnelFloorSpan, tunnelFloorSpan, 1f);
         floorQuad.transform.localScale = fScale;
         NormalizeMeshUVsToWorldSpacePosition(floorQuad, PrimitiveType.Quad, center + new Vector3(0f, 0.002f, 0f), fScale);
         floorQuad.GetComponent<Renderer>().sharedMaterial = stencilFloorMat;
 
-        float crumbWidth = cellSize * 0.625f;
+        float crumbWidth = isNarrowPlane ? (cellSize * 0.25f) : (cellSize * 0.625f);
         float stubLen = (cellSize - crumbWidth) * 0.5f;
         float stubOffset = (crumbWidth + stubLen) * 0.5f;
         float crumbY = 0.008f;
 
         GameObject[] crumbs = new GameObject[5];
         crumbs[4] = CreateCrumbPiece(cellObj.transform, "Crumb_Center", center, Vector3.up * crumbY, new Vector3(crumbWidth, 0.012f, crumbWidth), stencilCrumbMat);
-        crumbs[AmazingMazeData.DIR_LEFT] = CreateCrumbPiece(cellObj.transform, "Crumb_W", center, new Vector3(-stubOffset, crumbY, 0f), new Vector3(stubLen, 0.012f, crumbWidth), stencilCrumbMat);
-        crumbs[AmazingMazeData.DIR_DOWN] = CreateCrumbPiece(cellObj.transform, "Crumb_S", center, new Vector3(0f, crumbY, -stubOffset), new Vector3(crumbWidth, 0.012f, stubLen), stencilCrumbMat);
-        crumbs[AmazingMazeData.DIR_RIGHT] = CreateCrumbPiece(cellObj.transform, "Crumb_E", center, new Vector3(stubOffset, crumbY, 0f), new Vector3(stubLen, 0.012f, crumbWidth), stencilCrumbMat);
-        crumbs[AmazingMazeData.DIR_UP] = CreateCrumbPiece(cellObj.transform, "Crumb_N", center, new Vector3(0f, crumbY, stubOffset), new Vector3(crumbWidth, 0.012f, stubLen), stencilCrumbMat);
+
+        if (!isNarrowPlane)
+        {
+            crumbs[AmazingMazeData.DIR_LEFT] = CreateCrumbPiece(cellObj.transform, "Crumb_W", center, new Vector3(-stubOffset, crumbY, 0f), new Vector3(stubLen, 0.012f, crumbWidth), stencilCrumbMat);
+            crumbs[AmazingMazeData.DIR_DOWN] = CreateCrumbPiece(cellObj.transform, "Crumb_S", center, new Vector3(0f, crumbY, -stubOffset), new Vector3(crumbWidth, 0.012f, stubLen), stencilCrumbMat);
+            crumbs[AmazingMazeData.DIR_RIGHT] = CreateCrumbPiece(cellObj.transform, "Crumb_E", center, new Vector3(stubOffset, crumbY, 0f), new Vector3(stubLen, 0.012f, crumbWidth), stencilCrumbMat);
+            crumbs[AmazingMazeData.DIR_UP] = CreateCrumbPiece(cellObj.transform, "Crumb_N", center, new Vector3(0f, crumbY, stubOffset), new Vector3(crumbWidth, 0.012f, stubLen), stencilCrumbMat);
+        }
+        else
+        {
+            // On the upper narrow plane, the archway portal quads sit at +/- (tunnelFloorSpan * 0.5f) = +/- 0.87m,
+            // while the approach arms extend from 0.87m to 1.50m (cellSize * 0.5f) outside the stencil portal.
+            // Split each directional stub at the portal plane so the inner part uses stencilCrumbMat and the outer approach arm uses blackBreadcrumbMaterial!
+            float innerStubLen = (tunnelFloorSpan - crumbWidth) * 0.5f;
+            float innerOffset = (crumbWidth + innerStubLen) * 0.5f;
+            float outerArmLen = (cellSize - tunnelFloorSpan) * 0.5f;
+            float outerOffset = (tunnelFloorSpan + outerArmLen) * 0.5f;
+
+            GameObject CreateSplitNarrowBridgeCrumb(string name, Vector3 dirVec, bool alongZ)
+            {
+                GameObject group = new GameObject(name);
+                group.transform.SetParent(cellObj.transform, false);
+                group.transform.localPosition = Vector3.zero;
+
+                Vector3 innerPos = dirVec * innerOffset + Vector3.up * crumbY;
+                Vector3 innerScale = alongZ ? new Vector3(crumbWidth, 0.012f, innerStubLen) : new Vector3(innerStubLen, 0.012f, crumbWidth);
+                GameObject innerPiece = CreateCrumbPiece(group.transform, "InnerStencilStub", center, innerPos, innerScale, stencilCrumbMat);
+                innerPiece.SetActive(true);
+
+                Vector3 outerPos = dirVec * outerOffset + Vector3.up * crumbY;
+                Vector3 outerScale = alongZ ? new Vector3(crumbWidth, 0.015f, outerArmLen) : new Vector3(outerArmLen, 0.015f, crumbWidth);
+                GameObject outerPiece = CreateCrumbPiece(group.transform, "OuterApproachStub", center, outerPos, outerScale, blackBreadcrumbMaterial);
+                outerPiece.SetActive(true);
+
+                group.SetActive(false);
+                return group;
+            }
+
+            crumbs[AmazingMazeData.DIR_LEFT]  = CreateSplitNarrowBridgeCrumb("Crumb_W", Vector3.left, false);
+            crumbs[AmazingMazeData.DIR_DOWN]  = CreateSplitNarrowBridgeCrumb("Crumb_S", Vector3.back, true);
+            crumbs[AmazingMazeData.DIR_RIGHT] = CreateSplitNarrowBridgeCrumb("Crumb_E", Vector3.right, false);
+            crumbs[AmazingMazeData.DIR_UP]    = CreateSplitNarrowBridgeCrumb("Crumb_N", Vector3.forward, true);
+        }
 
         breadcrumbMeshes[(r, c, subLayer)] = crumbs;
     }
 
-    void BuildInwardStencilTunnelWalls(Transform parent, Vector3 cellCenter, bool alongZ, float doorH, float innerSpan, float tunnelLength, Material stencilWallMat, Material stencilEdgeMat, List<Collider> outColliders)
+    void BuildInwardStencilTunnelWalls(Transform parent, Vector3 cellCenter, bool alongZ, float doorH, float innerSpan, float tunnelLength, float wt, Material stencilWallMat, Material stencilEdgeMat, List<Collider> outColliders)
     {
         float halfInner = innerSpan * 0.5f;
+        float halfCol = (innerSpan + wt) * 0.5f;
         float ew = blackEdgeOutlineWidth;
 
         if (alongZ)
@@ -1391,8 +1790,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(-halfInner, doorH, 0f), new Vector3(ew, ew, tunnelLength + ew), stencilEdgeMat);
             }
 
-            outColliders.Add(CreateTunnelCollider(parent, "NS_EastCol", cellCenter + new Vector3(cellSize * 0.5f, 2.25f, 0f), new Vector3(wallThickness, 4.5f, cellSize)));
-            outColliders.Add(CreateTunnelCollider(parent, "NS_WestCol", cellCenter + new Vector3(-cellSize * 0.5f, 2.25f, 0f), new Vector3(wallThickness, 4.5f, cellSize)));
+            outColliders.Add(CreateTunnelCollider(parent, "NS_EastCol", cellCenter + new Vector3(halfCol, 1.05f, 0f), new Vector3(wt, 2.10f, tunnelLength)));
+            outColliders.Add(CreateTunnelCollider(parent, "NS_WestCol", cellCenter + new Vector3(-halfCol, 1.05f, 0f), new Vector3(wt, 2.10f, tunnelLength)));
         }
         else
         {
@@ -1408,8 +1807,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 CreateBlackEdgeBarWithMaterial(parent, cellCenter + new Vector3(0f, doorH, -halfInner), new Vector3(tunnelLength + ew, ew, ew), stencilEdgeMat);
             }
 
-            outColliders.Add(CreateTunnelCollider(parent, "EW_NorthCol", cellCenter + new Vector3(0f, 2.25f, cellSize * 0.5f), new Vector3(cellSize, 4.5f, wallThickness)));
-            outColliders.Add(CreateTunnelCollider(parent, "EW_SouthCol", cellCenter + new Vector3(0f, 2.25f, -cellSize * 0.5f), new Vector3(cellSize, 4.5f, wallThickness)));
+            outColliders.Add(CreateTunnelCollider(parent, "EW_NorthCol", cellCenter + new Vector3(0f, 1.05f, halfCol), new Vector3(tunnelLength, 2.10f, wt)));
+            outColliders.Add(CreateTunnelCollider(parent, "EW_SouthCol", cellCenter + new Vector3(0f, 1.05f, -halfCol), new Vector3(tunnelLength, 2.10f, wt)));
         }
     }
 
@@ -1494,6 +1893,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         bool[,] hWall = new bool[R + 2, C + 2];
         bool[,] vWall = new bool[R + 2, C + 2];
+        bool[,] rampStubN = new bool[R + 2, C + 2];
+        bool[,] rampStubS = new bool[R + 2, C + 2];
+        bool[,] rampStubW = new bool[R + 2, C + 2];
+        bool[,] rampStubE = new bool[R + 2, C + 2];
 
         bool IsOpenInDir(int r, int c, int dir)
         {
@@ -1506,6 +1909,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         bool IsAnyWideCarved(int r, int c)
         {
             if (r < 1 || r > R || c < 1 || c > C) return false;
+            if (MazeData.IsRamp(r, c)) return false;
             return ((MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BASE) |
                      MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BRIDGE)) & 0x0F) != 0;
         }
@@ -1514,6 +1918,31 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         {
             for (int c = 1; c <= C; c++)
             {
+                if (MazeData.IsRamp(r, c))
+                {
+                    int wOpen = MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BASE) & 0x0F;
+                    if ((wOpen & (1 << AmazingMazeData.DIR_UP)) != 0)
+                    {
+                        rampStubS[r - 1, c - 1] = true;
+                        rampStubS[r - 1, c] = true;
+                    }
+                    else if ((wOpen & (1 << AmazingMazeData.DIR_DOWN)) != 0)
+                    {
+                        rampStubN[r, c - 1] = true;
+                        rampStubN[r, c] = true;
+                    }
+                    else if ((wOpen & (1 << AmazingMazeData.DIR_LEFT)) != 0)
+                    {
+                        rampStubE[r - 1, c - 1] = true;
+                        rampStubE[r, c - 1] = true;
+                    }
+                    else if ((wOpen & (1 << AmazingMazeData.DIR_RIGHT)) != 0)
+                    {
+                        rampStubW[r - 1, c] = true;
+                        rampStubW[r, c] = true;
+                    }
+                    continue;
+                }
                 if (!IsAnyWideCarved(r, c)) continue;
                 if (!IsOpenInDir(r, c, AmazingMazeData.DIR_UP)) hWall[r - 1, c] = true;
                 if (!IsOpenInDir(r, c, AmazingMazeData.DIR_DOWN)) hWall[r, c] = true;
@@ -1596,10 +2025,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 bool brSE = IsBridgeCell(vr + 1, vc + 1);
                 bool isBridgeCorner = brNW || brNE || brSW || brSE;
 
-                bool hasN = (vr >= 1) && vWall[vr, vc];
-                bool hasS = (vr < R) && vWall[vr + 1, vc];
-                bool hasW = (vc >= 1) && hWall[vr, vc];
-                bool hasE = (vc < C) && hWall[vr, vc + 1];
+                bool hasN = ((vr >= 1) && vWall[vr, vc]) || rampStubN[vr, vc];
+                bool hasS = ((vr < R) && vWall[vr + 1, vc]) || rampStubS[vr, vc];
+                bool hasW = ((vc >= 1) && hWall[vr, vc]) || rampStubW[vr, vc];
+                bool hasE = ((vc < C) && hWall[vr, vc + 1]) || rampStubE[vr, vc];
 
                 if (!isBridgeCorner && !hasN && !hasS && !hasW && !hasE) continue;
 
@@ -1726,9 +2155,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     {
         GameObject colObj = new GameObject("WallCollider");
         colObj.transform.SetParent(parent, false);
-        colObj.transform.position = new Vector3(worldPos.x, 2.25f, worldPos.z);
+        colObj.transform.position = new Vector3(worldPos.x, 1.05f, worldPos.z);
         BoxCollider bc = colObj.AddComponent<BoxCollider>();
-        bc.size = new Vector3(size.x, 4.5f, size.z);
+        bc.size = new Vector3(size.x, 2.10f, size.z);
     }
 
     void BuildUnoccupiedCheckerboardCell(int r, int c)
@@ -1856,10 +2285,566 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
 
         BoxCollider col = wallGroup.AddComponent<BoxCollider>();
-        col.center = new Vector3(0f, 2.25f, 0f);
+        col.center = new Vector3(0f, 1.05f, 0f);
         col.size = alongZ
-            ? new Vector3(wallThickness, 4.5f, length + wallThickness)
-            : new Vector3(length + wallThickness, 4.5f, wallThickness);
+            ? new Vector3(wallThickness, 2.10f, length + wallThickness)
+            : new Vector3(length + wallThickness, 2.10f, wallThickness);
+    }
+
+    void BuildUpperNarrowCorridorCell(int r, int c, int nBaseOpen)
+    {
+        Vector3 center = CellToWorldCenter(r, c, upperFloorY);
+        GameObject cellObj = new GameObject($"NarrowCell_{r}_{c}_Sub3");
+        cellObj.transform.SetParent(mazeRoot.transform, false);
+        cellObj.transform.position = center;
+
+        float innerW = narrowCorridorWidth;
+        float nwt = narrowWallThickness;
+        float halfWT = nwt * 0.5f;
+        float nwh = narrowWallHeight;
+        float halfWall = (innerW + nwt) * 0.5f;
+        float outerHW = innerW * 0.5f + nwt;
+        float outerW = outerHW * 2f;
+        float armLen = cellSize * 0.5f - outerHW;
+        float armMid = outerHW + armLen * 0.5f;
+        float floorThick = 0.12f;
+        float ew = blackEdgeOutlineWidth;
+
+        // 1. Center junction floor slab
+        GameObject centerFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        centerFloor.name = "NarrowCenterFloor";
+        centerFloor.transform.SetParent(cellObj.transform, false);
+        centerFloor.transform.position = center + new Vector3(0f, -floorThick * 0.5f, 0f);
+        Vector3 cfScale = new Vector3(outerW, floorThick, outerW);
+        centerFloor.transform.localScale = cfScale;
+        NormalizeMeshUVsToWorldSpacePosition(centerFloor, PrimitiveType.Cube, centerFloor.transform.position, cfScale);
+        centerFloor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
+        ConfigureFloorTeleportationArea(centerFloor);
+
+        bool openN = (nBaseOpen & (1 << AmazingMazeData.DIR_UP)) != 0;
+        bool openS = (nBaseOpen & (1 << AmazingMazeData.DIR_DOWN)) != 0;
+        bool openW = (nBaseOpen & (1 << AmazingMazeData.DIR_LEFT)) != 0;
+        bool openE = (nBaseOpen & (1 << AmazingMazeData.DIR_RIGHT)) != 0;
+
+        // 2. 4 Corner Posts around the center junction
+        for (int sx = -1; sx <= 1; sx += 2)
+        {
+            for (int sz = -1; sz <= 1; sz += 2)
+            {
+                Vector3 pPos = center + new Vector3(sx * halfWall, 0f, sz * halfWall);
+                CreateWallBoxWithMaterial(cellObj.transform, $"NarrowPost_{sx}_{sz}", pPos + new Vector3(0f, nwh * 0.5f, 0f), new Vector3(nwt, nwh, nwt), whiteWallMaterial);
+
+                if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                {
+                    bool openX = (sx == 1) ? openE : openW;
+                    bool openZ = (sz == 1) ? openN : openS;
+
+                    bool attachPosX = openX;
+                    bool attachNegX = !openZ;
+                    bool attachPosZ = openZ;
+                    bool attachNegZ = !openX;
+
+                    if (!attachPosX)
+                    {
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(sx * halfWT, nwh, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(sx * halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
+                    }
+                    if (!attachNegX)
+                    {
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(-sx * halfWT, nwh, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(-sx * halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
+                    }
+                    if (!attachPosZ)
+                    {
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, nwh, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, ew * 0.5f, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
+                    }
+                    if (!attachNegZ)
+                    {
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, nwh, -sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, ew * 0.5f, -sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
+                    }
+
+                    if (!openX)
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(sx * halfWT, -floorThick, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
+                    if (!openZ)
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, -floorThick, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
+
+                    for (int qx = -1; qx <= 1; qx += 2)
+                    {
+                        for (int qz = -1; qz <= 1; qz += 2)
+                        {
+                            bool wallAlongX = (qx == sx) ? attachPosX : attachNegX;
+                            bool wallAlongZ = (qz == sz) ? attachPosZ : attachNegZ;
+                            if (wallAlongX == wallAlongZ)
+                            {
+                                CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(qx * halfWT, nwh * 0.5f, qz * halfWT), new Vector3(ew, nwh + ew, ew), blackEdgeMaterial);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Open Arms or Closed Cross-Walls in each of the 4 directions
+        for (int dir = 0; dir < 4; dir++)
+        {
+            bool isOpen = (nBaseOpen & (1 << dir)) != 0;
+            bool alongZ = (dir == AmazingMazeData.DIR_UP || dir == AmazingMazeData.DIR_DOWN);
+            float sign = (dir == AmazingMazeData.DIR_UP || dir == AmazingMazeData.DIR_RIGHT) ? 1f : -1f;
+
+            if (isOpen)
+            {
+                Vector3 armCenter = center + (alongZ ? new Vector3(0f, 0f, sign * armMid) : new Vector3(sign * armMid, 0f, 0f));
+                Vector3 fScale = alongZ ? new Vector3(outerW, floorThick, armLen) : new Vector3(armLen, floorThick, outerW);
+
+                GameObject armFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                armFloor.name = $"NarrowArmFloor_{dir}";
+                armFloor.transform.SetParent(cellObj.transform, false);
+                armFloor.transform.position = armCenter + new Vector3(0f, -floorThick * 0.5f, 0f);
+                armFloor.transform.localScale = fScale;
+                NormalizeMeshUVsToWorldSpacePosition(armFloor, PrimitiveType.Cube, armFloor.transform.position, fScale);
+                armFloor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
+                ConfigureFloorTeleportationArea(armFloor);
+
+                for (int side = -1; side <= 1; side += 2)
+                {
+                    Vector3 wallPos = armCenter + (alongZ ? new Vector3(side * halfWall, nwh * 0.5f, 0f) : new Vector3(0f, nwh * 0.5f, side * halfWall));
+                    Vector3 wallScale = alongZ ? new Vector3(nwt, nwh, armLen) : new Vector3(armLen, nwh, nwt);
+                    CreateWallBoxWithMaterial(cellObj.transform, "NarrowArmSideWall", wallPos, wallScale, whiteWallMaterial);
+
+                    Vector3 colPos = armCenter + (alongZ ? new Vector3(side * halfWall, 1.5f, 0f) : new Vector3(0f, 1.5f, side * halfWall));
+                    CreateTunnelCollider(cellObj.transform, "NarrowArmCol", colPos, alongZ ? new Vector3(nwt, 3.0f, armLen) : new Vector3(armLen, 3.0f, nwt));
+
+                    if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                    {
+                        for (int fSide = -1; fSide <= 1; fSide += 2)
+                        {
+                            Vector3 topBar = armCenter + (alongZ ? new Vector3(side * halfWall + fSide * halfWT, nwh, 0f) : new Vector3(0f, nwh, side * halfWall + fSide * halfWT));
+                            Vector3 botBar = armCenter + (alongZ ? new Vector3(side * halfWall + fSide * halfWT, ew * 0.5f, 0f) : new Vector3(0f, ew * 0.5f, side * halfWall + fSide * halfWT));
+                            Vector3 barScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
+                            CreateBlackEdgeBarWithMaterial(cellObj.transform, topBar, barScale, blackEdgeMaterial);
+                            CreateBlackEdgeBarWithMaterial(cellObj.transform, botBar, barScale, blackEdgeMaterial);
+                        }
+                        Vector3 underBar = armCenter + (alongZ ? new Vector3(side * outerHW, -floorThick, 0f) : new Vector3(0f, -floorThick, side * outerHW));
+                        Vector3 underScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, underBar, underScale, blackEdgeMaterial);
+                    }
+                }
+            }
+            else
+            {
+                Vector3 closeMid = center + (alongZ ? new Vector3(0f, 0f, sign * halfWall) : new Vector3(sign * halfWall, 0f, 0f));
+                Vector3 closeScale = alongZ ? new Vector3(innerW, nwh, nwt) : new Vector3(nwt, nwh, innerW);
+                CreateWallBoxWithMaterial(cellObj.transform, $"NarrowCloseWall_{dir}", closeMid + new Vector3(0f, nwh * 0.5f, 0f), closeScale, whiteWallMaterial);
+
+                CreateTunnelCollider(cellObj.transform, $"NarrowCloseCol_{dir}", closeMid + new Vector3(0f, 1.5f, 0f), alongZ ? new Vector3(outerW, 3.0f, nwt) : new Vector3(nwt, 3.0f, outerW));
+
+                if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                {
+                    for (int fSide = -1; fSide <= 1; fSide += 2)
+                    {
+                        Vector3 topBar = closeMid + (alongZ ? new Vector3(0f, nwh, fSide * halfWT) : new Vector3(fSide * halfWT, nwh, 0f));
+                        Vector3 botBar = closeMid + (alongZ ? new Vector3(0f, ew * 0.5f, fSide * halfWT) : new Vector3(fSide * halfWT, ew * 0.5f, 0f));
+                        Vector3 barScale = alongZ ? new Vector3(innerW + ew, ew, ew) : new Vector3(ew, ew, innerW + ew);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, topBar, barScale, blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, botBar, barScale, blackEdgeMaterial);
+                    }
+                    Vector3 underBar = closeMid + (alongZ ? new Vector3(0f, -floorThick, sign * halfWT) : new Vector3(sign * halfWT, -floorThick, 0f));
+                    Vector3 underScale = alongZ ? new Vector3(innerW + ew, ew, ew) : new Vector3(ew, ew, innerW + ew);
+                    CreateBlackEdgeBarWithMaterial(cellObj.transform, underBar, underScale, blackEdgeMaterial);
+                }
+            }
+        }
+
+        // 4. Upper Narrow Breadcrumbs
+        float crumbWidth = cellSize * 0.25f;
+        float stubLen = (cellSize - crumbWidth) * 0.5f;
+        float stubOffset = (crumbWidth + stubLen) * 0.5f;
+        float crumbY = 0.008f;
+
+        GameObject[] crumbs = new GameObject[5];
+        crumbs[4] = CreateCrumbPiece(cellObj.transform, "Crumb_Center", center, Vector3.up * crumbY, new Vector3(crumbWidth, 0.015f, crumbWidth), blackBreadcrumbMaterial);
+        crumbs[AmazingMazeData.DIR_LEFT]  = CreateCrumbPiece(cellObj.transform, "Crumb_W", center, new Vector3(-stubOffset, crumbY, 0f), new Vector3(stubLen, 0.015f, crumbWidth), blackBreadcrumbMaterial);
+        crumbs[AmazingMazeData.DIR_DOWN]  = CreateCrumbPiece(cellObj.transform, "Crumb_S", center, new Vector3(0f, crumbY, -stubOffset), new Vector3(crumbWidth, 0.015f, stubLen), blackBreadcrumbMaterial);
+        crumbs[AmazingMazeData.DIR_RIGHT] = CreateCrumbPiece(cellObj.transform, "Crumb_E", center, new Vector3(stubOffset, crumbY, 0f),  new Vector3(stubLen, 0.015f, crumbWidth), blackBreadcrumbMaterial);
+        crumbs[AmazingMazeData.DIR_UP]    = CreateCrumbPiece(cellObj.transform, "Crumb_N", center, new Vector3(0f, crumbY, stubOffset),  new Vector3(crumbWidth, 0.015f, stubLen), blackBreadcrumbMaterial);
+
+        breadcrumbMeshes[(r, c, AmazingMazeData.LAYER_NARROW_BASE)] = crumbs;
+    }
+
+    void BuildTaperedRampStairsCell(int r, int c, int wBaseOpen, int nBaseOpen)
+    {
+        Vector3 cellCenter = CellToWorldCenter(r, c, 0f);
+        GameObject rampObj = new GameObject($"TaperedRampStairs_{r}_{c}");
+        rampObj.transform.SetParent(mazeRoot.transform, false);
+        rampObj.transform.position = cellCenter;
+
+        int wideDir = 0, narrowDir = 2;
+        for (int d = 0; d < 4; d++)
+        {
+            if ((wBaseOpen & (1 << d)) != 0) wideDir = d;
+            if ((nBaseOpen & (1 << d)) != 0) narrowDir = d;
+        }
+
+        // fwd points from the lower wide entrance (s = -1.5m) into the ramp cell toward s = +1.5m
+        Vector3 fwd = -DirToWorldVec(wideDir);
+        Vector3 right = new Vector3(fwd.z, 0f, -fwd.x);
+        bool fwdAlongZ = Mathf.Abs(fwd.z) > 0.5f;
+
+        Vector3 LocalToWorld(float uRight, float y, float sFwd)
+        {
+            return cellCenter + right * uRight + Vector3.up * y + fwd * sFwd;
+        }
+
+        Vector3 LocalScale(float sizeRight, float sizeY, float sizeFwd)
+        {
+            return fwdAlongZ ? new Vector3(sizeRight, sizeY, sizeFwd) : new Vector3(sizeFwd, sizeY, sizeRight);
+        }
+
+        float wt = wallThickness;
+        float halfWT = wt * 0.5f;
+        float wh = wallHeight;
+        float nwt = narrowWallThickness;
+        float halfNWT = nwt * 0.5f;
+        float nwh = narrowWallHeight;
+        float ew = blackEdgeOutlineWidth;
+        float halfWideInner = (cellSize - wt) * 0.5f;
+        float halfNarrowInner = narrowCorridorWidth * 0.5f;
+
+        List<GameObject> rampCrumbs = new List<GameObject>();
+
+        bool isStraightRamp = (narrowDir == AmazingMazeData.DirOpp(wideDir));
+
+        if (isStraightRamp)
+        {
+            // 1. Lower Wide Entrance Landing (s in [-1.50, -1.10])
+            float lowLandingLen = 0.40f;
+            float lowLandingMidS = -cellSize * 0.5f + lowLandingLen * 0.5f;
+            Vector3 lowFloorPos = LocalToWorld(0f, -0.05f, lowLandingMidS);
+            Vector3 lowFloorScale = LocalScale(cellSize, 0.1f, lowLandingLen);
+            CreateWallBoxWithMaterial(rampObj.transform, "RampLowerLanding", lowFloorPos, lowFloorScale, whiteFloorMaterial);
+
+            // Wide side wall stubs connecting flush with the vertex corner posts at s = -1.50 + halfWT
+            float stubLen = lowLandingLen - halfWT;
+            float stubMidS = -cellSize * 0.5f + halfWT + stubLen * 0.5f;
+            for (int side = -1; side <= 1; side += 2)
+            {
+                Vector3 stubPos = LocalToWorld(side * halfWideInner, wh * 0.5f, stubMidS);
+                CreateWallBoxWithMaterial(rampObj.transform, "RampWideStubWall", stubPos, LocalScale(wt, wh, stubLen), whiteWallMaterial);
+                if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                {
+                    for (int fSide = -1; fSide <= 1; fSide += 2)
+                    {
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * halfWideInner + fSide * halfWT, wh, stubMidS), LocalScale(ew, ew, stubLen + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * halfWideInner + fSide * halfWT, ew * 0.5f, stubMidS), LocalScale(ew, ew, stubLen + ew), blackEdgeMaterial);
+                    }
+                }
+            }
+
+            // Crumb on lower landing
+            float crumbWide = cellSize * 0.625f;
+            rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, "RampCrumb_Low", cellCenter, LocalToWorld(0f, 0.008f, lowLandingMidS) - cellCenter, LocalScale(crumbWide, 0.015f, lowLandingLen), blackBreadcrumbMaterial));
+
+            // 2. 10 Tapered Steps (s in [-1.10, +1.10], rising from y = 0.24m to y = upperFloorY)
+            int numSteps = 10;
+            float stairStartS = -1.10f;
+            float stairEndS = 1.10f;
+            float stepDepth = (stairEndS - stairStartS) / numSteps;
+            float stepRise = upperFloorY / numSteps;
+
+            for (int i = 0; i < numSteps; i++)
+            {
+                float t = (i + 0.5f) / numSteps;
+                // Taper occurs sharply in the middle steps to match the 45-degree Macintosh taper
+                float taperT = Mathf.Clamp01((t - 0.15f) / 0.70f);
+                float curHalfInner = Mathf.Lerp(halfWideInner - halfWT, halfNarrowInner, taperT);
+                float curWallThick = Mathf.Lerp(wt, nwt, taperT);
+                float curWallH = Mathf.Lerp(wh, nwh, taperT);
+
+                float stepMidS = stairStartS + (i + 0.5f) * stepDepth;
+                float stepTopY = (i + 1) * stepRise;
+                float stepBotY = Mathf.Max(0f, i * stepRise - 0.12f);
+                float blockH = stepTopY - stepBotY;
+
+                // Step tread & riser block
+                Vector3 stepPos = LocalToWorld(0f, stepBotY + blockH * 0.5f, stepMidS);
+                Vector3 stepScale = LocalScale((curHalfInner + curWallThick) * 2f, blockH, stepDepth + 0.005f);
+                CreateWallBoxWithMaterial(rampObj.transform, $"StairStep_{i}", stepPos, stepScale, whiteFloorMaterial);
+
+                // Front nose & riser bottom black outlines across the step tread
+                if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                {
+                    float frontS = stairStartS + i * stepDepth;
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, stepTopY, frontS), LocalScale(curHalfInner * 2f + ew, ew, ew), blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, i * stepRise + ew * 0.5f, frontS), LocalScale(curHalfInner * 2f + ew, ew, ew), blackEdgeMaterial);
+                }
+
+                // Tapered stepped parapet walls on left & right of each step
+                for (int side = -1; side <= 1; side += 2)
+                {
+                    float wallCenterU = side * (curHalfInner + curWallThick * 0.5f);
+                    float wTopY = stepTopY + curWallH;
+                    float wHeight = wTopY - stepBotY;
+                    Vector3 wPos = LocalToWorld(wallCenterU, stepBotY + wHeight * 0.5f, stepMidS);
+                    Vector3 wScale = LocalScale(curWallThick, wHeight, stepDepth + 0.01f);
+                    CreateWallBoxWithMaterial(rampObj.transform, $"StairSideWall_{i}_{side}", wPos, wScale, whiteWallMaterial);
+
+                    if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                    {
+                        float innerU = side * curHalfInner;
+                        float outerU = side * (curHalfInner + curWallThick);
+                        float frontS = stairStartS + i * stepDepth;
+                        float backS = frontS + stepDepth;
+
+                        // Top horizontal bars on inner & outer faces of the stepped parapet
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, wTopY, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, wTopY, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
+                        // Step-to-wall inner crease bar
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, stepTopY + ew * 0.5f, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
+                        // Front top transverse cap bar on the step parapet riser
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(wallCenterU, wTopY, frontS), LocalScale(curWallThick + ew, ew, ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, wTopY - stepRise * 0.5f, frontS), LocalScale(ew, stepRise + ew, ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, wTopY - stepRise * 0.5f, frontS), LocalScale(ew, stepRise + ew, ew), blackEdgeMaterial);
+                        // Vertical inner riser corner bars
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, stepTopY - stepRise * 0.5f, frontS), LocalScale(ew, stepRise + ew, ew), blackEdgeMaterial);
+                    }
+                }
+
+                // Step breadcrumb strip on top of step i ( plus riser crumb so path looks continuous from any angle!)
+                float curCrumbW = Mathf.Lerp(crumbWide, cellSize * 0.25f, taperT);
+                rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, $"RampCrumb_Step_{i}", cellCenter, LocalToWorld(0f, stepTopY + 0.008f, stepMidS) - cellCenter, LocalScale(curCrumbW, 0.015f, stepDepth + 0.01f), blackBreadcrumbMaterial));
+                rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, $"RampCrumb_Riser_{i}", cellCenter, LocalToWorld(0f, stepTopY - stepRise * 0.5f, stairStartS + i * stepDepth - 0.006f) - cellCenter, LocalScale(curCrumbW, stepRise, 0.012f), blackBreadcrumbMaterial));
+            }
+
+            // 3. Upper Narrow Exit Landing (s in [+1.10, +1.50])
+            float highLandingLen = 0.40f;
+            float highLandingMidS = cellSize * 0.5f - highLandingLen * 0.5f;
+            float floorThick = 0.12f;
+            float outerNarrowW = narrowCorridorWidth + nwt * 2f;
+            Vector3 highFloorPos = LocalToWorld(0f, upperFloorY - floorThick * 0.5f, highLandingMidS);
+            CreateWallBoxWithMaterial(rampObj.transform, "RampUpperLanding", highFloorPos, LocalScale(outerNarrowW, floorThick, highLandingLen), whiteFloorMaterial);
+
+            float highWallU = (narrowCorridorWidth + nwt) * 0.5f;
+            for (int side = -1; side <= 1; side += 2)
+            {
+                Vector3 hwPos = LocalToWorld(side * highWallU, upperFloorY + nwh * 0.5f, highLandingMidS);
+                CreateWallBoxWithMaterial(rampObj.transform, "RampNarrowExitWall", hwPos, LocalScale(nwt, nwh, highLandingLen), whiteWallMaterial);
+                if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                {
+                    for (int fSide = -1; fSide <= 1; fSide += 2)
+                    {
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * highWallU + fSide * halfNWT, upperFloorY + nwh, highLandingMidS), LocalScale(ew, ew, highLandingLen + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * highWallU + fSide * halfNWT, upperFloorY + ew * 0.5f, highLandingMidS), LocalScale(ew, ew, highLandingLen + ew), blackEdgeMaterial);
+                    }
+                }
+            }
+
+            rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, "RampCrumb_High", cellCenter, LocalToWorld(0f, upperFloorY + 0.008f, highLandingMidS) - cellCenter, LocalScale(cellSize * 0.25f, 0.015f, highLandingLen), blackBreadcrumbMaterial));
+
+            // 4. Flanking Low Checkerboard Blocks on left/right of the narrowed upper half + ground-level back wall
+            float flankW = (cellSize - outerNarrowW) * 0.5f;
+            float flankMidU = outerNarrowW * 0.5f + flankW * 0.5f;
+            float flankLen = 1.60f;
+            float flankMidS = cellSize * 0.5f - flankLen * 0.5f;
+            float chkH = Mathf.Max(0.1f, wh - 0.04f);
+            for (int side = -1; side <= 1; side += 2)
+            {
+                GameObject chk = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                Destroy(chk.GetComponent<Collider>());
+                chk.transform.SetParent(rampObj.transform, false);
+                Vector3 chkPos = LocalToWorld(side * flankMidU, chkH * 0.5f - 0.02f, flankMidS);
+                Vector3 chkScale = LocalScale(flankW, chkH, flankLen);
+                chk.transform.position = chkPos;
+                chk.transform.localScale = chkScale;
+                NormalizeMeshUVsToWorldSpacePosition(chk, PrimitiveType.Cube, chkPos, chkScale, checkerSquaresPerMeter * 0.5f);
+                chk.GetComponent<Renderer>().sharedMaterial = checkerboardMaterial;
+            }
+
+            // Ground-level closing wall on the back & left/right exterior boundaries so adjacent cells see clean walls
+            CreateWallBoxWithMaterial(rampObj.transform, "RampGroundBackWall", LocalToWorld(0f, wh * 0.5f, cellSize * 0.5f), LocalScale(cellSize - wt, wh, wt), whiteWallMaterial);
+            for (int side = -1; side <= 1; side += 2)
+            {
+                CreateWallBoxWithMaterial(rampObj.transform, "RampGroundSideWall", LocalToWorld(side * cellSize * 0.5f, wh * 0.5f, 0f), LocalScale(wt, wh, cellSize - wt), whiteWallMaterial);
+            }
+
+            // 5. Smooth Physics Colliders & Teleportation Surfaces for walking and teleporting up/down the straight tapered ramp
+            Collider lowLandCol = CreateTunnelCollider(rampObj.transform, "RampLowLandingCol", LocalToWorld(0f, -0.05f, lowLandingMidS), LocalScale(cellSize, 0.1f, lowLandingLen));
+            ConfigureFloorTeleportationArea(lowLandCol.gameObject);
+            stairFloorColliders.Add(lowLandCol);
+
+            Collider highLandCol = CreateTunnelCollider(rampObj.transform, "RampHighLandingCol", LocalToWorld(0f, upperFloorY - 0.05f, highLandingMidS), LocalScale(outerNarrowW, 0.1f, highLandingLen));
+            ConfigureFloorTeleportationArea(highLandCol.gameObject);
+            stairFloorColliders.Add(highLandCol);
+
+            float slopeRun = stairEndS - stairStartS;
+            float slopeLen = Mathf.Sqrt(slopeRun * slopeRun + upperFloorY * upperFloorY);
+            float slopeAngle = Mathf.Atan2(upperFloorY, slopeRun) * Mathf.Rad2Deg;
+            GameObject slopeColObj = new GameObject("RampSlopeCollider");
+            slopeColObj.transform.SetParent(rampObj.transform, false);
+            slopeColObj.transform.position = LocalToWorld(0f, upperFloorY * 0.5f - 0.04f, 0f);
+            slopeColObj.transform.rotation = Quaternion.LookRotation(fwd, Vector3.up) * Quaternion.Euler(-slopeAngle, 0f, 0f);
+            BoxCollider slopeBC = slopeColObj.AddComponent<BoxCollider>();
+            slopeBC.size = new Vector3(cellSize, 0.1f, slopeLen);
+            ConfigureFloorTeleportationArea(slopeColObj);
+            stairFloorColliders.Add(slopeBC);
+
+            // Angled side-wall colliders that taper smoothly from wide (u = +/-1.32m) to narrow (u = +/-0.75m)
+            for (int side = -1; side <= 1; side += 2)
+            {
+                Vector3 pStart = LocalToWorld(side * halfWideInner, 2.0f, -1.10f);
+                Vector3 pEnd   = LocalToWorld(side * highWallU, 2.0f, 1.10f);
+                Vector3 segVec = pEnd - pStart;
+                GameObject taperWallCol = new GameObject($"RampTaperSideCol_{side}");
+                taperWallCol.transform.SetParent(rampObj.transform, false);
+                taperWallCol.transform.position = (pStart + pEnd) * 0.5f;
+                taperWallCol.transform.rotation = Quaternion.LookRotation(segVec.normalized, Vector3.up);
+                taperWallCol.AddComponent<BoxCollider>().size = new Vector3(nwt, 4.5f, segVec.magnitude);
+
+                CreateTunnelCollider(rampObj.transform, "RampSideCol_HighStub", LocalToWorld(side * highWallU, upperFloorY + 1.2f, highLandingMidS), LocalScale(nwt, 2.6f, highLandingLen));
+            }
+        }
+        else
+        {
+            // 90-DEGREE CORNER TURNING RAMP (Level 4):
+            // Enters wide from wideDir (s = -1.50m, y = 0m) and turns 90 degrees toward narrowDir (turnSign * right, y = upperFloorY)
+            Vector3 narrowVec = DirToWorldVec(narrowDir);
+            float turnSign = (Vector3.Dot(narrowVec, right) >= 0f) ? 1f : -1f;
+
+            // 1. Lower Wide Entrance Flight: 5 steps rising from y = 0m to y = 1.20m along s in [-1.50, -0.35]
+            int lowSteps = 5;
+            float lowStartS = -1.35f;
+            float lowEndS = -0.35f;
+            float lowStepDepth = (lowEndS - lowStartS) / lowSteps;
+            float midY = upperFloorY * 0.5f;
+            float lowStepRise = midY / lowSteps;
+
+            CreateWallBoxWithMaterial(rampObj.transform, "CornerRampEntryPad", LocalToWorld(0f, -0.05f, -1.425f), LocalScale(cellSize, 0.1f, 0.15f), whiteFloorMaterial);
+
+            for (int i = 0; i < lowSteps; i++)
+            {
+                float t = (i + 0.5f) / lowSteps;
+                float curHalfInner = Mathf.Lerp(halfWideInner - halfWT, halfNarrowInner + 0.15f, t);
+                float stepMidS = lowStartS + (i + 0.5f) * lowStepDepth;
+                float stepTopY = (i + 1) * lowStepRise;
+
+                CreateWallBoxWithMaterial(rampObj.transform, $"CornerLowStep_{i}", LocalToWorld(0f, stepTopY * 0.5f, stepMidS), LocalScale((curHalfInner + nwt) * 2f, stepTopY, lowStepDepth + 0.01f), whiteFloorMaterial);
+                if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                {
+                    float frontS = lowStartS + i * lowStepDepth;
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, stepTopY, frontS), LocalScale(curHalfInner * 2f + ew, ew, ew), blackEdgeMaterial);
+                }
+
+                for (int side = -1; side <= 1; side += 2)
+                {
+                    float wU = side * (curHalfInner + halfNWT);
+                    CreateWallBoxWithMaterial(rampObj.transform, $"CornerLowWall_{i}_{side}", LocalToWorld(wU, stepTopY + nwh * 0.5f, stepMidS), LocalScale(nwt, nwh, lowStepDepth + 0.01f), whiteWallMaterial);
+                    if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                    {
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * curHalfInner, stepTopY + nwh, stepMidS), LocalScale(ew, ew, lowStepDepth + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * (curHalfInner + nwt), stepTopY + nwh, stepMidS), LocalScale(ew, ew, lowStepDepth + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * curHalfInner, stepTopY + ew * 0.5f, stepMidS), LocalScale(ew, ew, lowStepDepth + ew), blackEdgeMaterial);
+                    }
+                }
+
+                float curCrumbW = Mathf.Lerp(cellSize * 0.625f, cellSize * 0.25f, t);
+                rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, $"CornerCrumb_Low_{i}", cellCenter, LocalToWorld(0f, stepTopY + 0.008f, stepMidS) - cellCenter, LocalScale(curCrumbW, 0.015f, lowStepDepth + 0.02f), blackBreadcrumbMaterial));
+            }
+
+            // 2. Corner Turn Mid-Landing at y = midY (s in [-0.35, +0.63], u in [-0.63, +0.63])
+            float landHalf = halfNarrowInner + nwt;
+            CreateWallBoxWithMaterial(rampObj.transform, "CornerMidLanding", LocalToWorld(0f, midY * 0.5f, 0.14f), LocalScale(landHalf * 2f, midY, 0.98f), whiteFloorMaterial);
+            rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, "CornerCrumb_Mid", cellCenter, LocalToWorld(0f, midY + 0.008f, 0f) - cellCenter, LocalScale(cellSize * 0.25f, 0.015f, cellSize * 0.25f), blackBreadcrumbMaterial));
+
+            // Back & outer corner parapet walls around the mid-landing
+            float highWallOffset = (narrowCorridorWidth + nwt) * 0.5f;
+            CreateWallBoxWithMaterial(rampObj.transform, "CornerMidBackWall", LocalToWorld(0f, midY + nwh * 0.5f, highWallOffset), LocalScale(landHalf * 2f, nwh, nwt), whiteWallMaterial);
+            CreateWallBoxWithMaterial(rampObj.transform, "CornerMidOuterWall", LocalToWorld(-turnSign * highWallOffset, midY + nwh * 0.5f, 0.14f), LocalScale(nwt, nwh, 0.98f), whiteWallMaterial);
+            if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+            {
+                CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, midY + nwh, halfNarrowInner), LocalScale(narrowCorridorWidth + ew, ew, ew), blackEdgeMaterial);
+                CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, midY + ew * 0.5f, halfNarrowInner), LocalScale(narrowCorridorWidth + ew, ew, ew), blackEdgeMaterial);
+                CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(-turnSign * halfNarrowInner, midY + nwh, 0.14f), LocalScale(ew, ew, 0.98f + ew), blackEdgeMaterial);
+                CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(-turnSign * halfNarrowInner, midY + ew * 0.5f, 0.14f), LocalScale(ew, ew, 0.98f + ew), blackEdgeMaterial);
+            }
+
+            // 3. Upper Narrow Exit Flight: 5 steps rising from y = midY to y = upperFloorY along turnSign * u in [0.50, 1.50]
+            int highSteps = 5;
+            float highStartU = 0.50f;
+            float highEndU = 1.50f;
+            float highStepDepth = (highEndU - highStartU) / highSteps;
+            float highStepRise = (upperFloorY - midY) / highSteps;
+
+            for (int i = 0; i < highSteps; i++)
+            {
+                float stepMidU = turnSign * (highStartU + (i + 0.5f) * highStepDepth);
+                float stepTopY = midY + (i + 1) * highStepRise;
+                float stepBotY = midY - 0.12f;
+                float blockH = stepTopY - stepBotY;
+
+                CreateWallBoxWithMaterial(rampObj.transform, $"CornerHighStep_{i}", LocalToWorld(stepMidU, stepBotY + blockH * 0.5f, 0f), LocalScale(highStepDepth + 0.01f, blockH, (halfNarrowInner + nwt) * 2f), whiteFloorMaterial);
+                if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                {
+                    float frontU = turnSign * (highStartU + i * highStepDepth);
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(frontU, stepTopY, 0f), LocalScale(ew, ew, narrowCorridorWidth + ew), blackEdgeMaterial);
+                }
+
+                for (int sSide = -1; sSide <= 1; sSide += 2)
+                {
+                    float wallS = sSide * highWallOffset;
+                    CreateWallBoxWithMaterial(rampObj.transform, $"CornerHighWall_{i}_{sSide}", LocalToWorld(stepMidU, stepTopY + nwh * 0.5f, wallS), LocalScale(highStepDepth + 0.01f, nwh, nwt), whiteWallMaterial);
+                    if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                    {
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(stepMidU, stepTopY + nwh, sSide * halfNarrowInner), LocalScale(highStepDepth + ew, ew, ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(stepMidU, stepTopY + nwh, sSide * (halfNarrowInner + nwt)), LocalScale(highStepDepth + ew, ew, ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(stepMidU, stepTopY + ew * 0.5f, sSide * halfNarrowInner), LocalScale(highStepDepth + ew, ew, ew), blackEdgeMaterial);
+                    }
+                }
+
+                rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, $"CornerCrumb_High_{i}", cellCenter, LocalToWorld(stepMidU, stepTopY + 0.008f, 0f) - cellCenter, LocalScale(highStepDepth + 0.02f, 0.015f, cellSize * 0.25f), blackBreadcrumbMaterial));
+            }
+
+            // Ground-level closing walls on the 3 non-wide sides of the cell
+            CreateWallBoxWithMaterial(rampObj.transform, "CornerGroundBackWall", LocalToWorld(0f, wh * 0.5f, cellSize * 0.5f), LocalScale(cellSize - wt, wh, wt), whiteWallMaterial);
+            for (int side = -1; side <= 1; side += 2)
+            {
+                CreateWallBoxWithMaterial(rampObj.transform, "CornerGroundSideWall", LocalToWorld(side * cellSize * 0.5f, wh * 0.5f, 0f), LocalScale(wt, wh, cellSize - wt), whiteWallMaterial);
+            }
+
+            // Smooth physics colliders & teleport surfaces for the 2 flights + mid-landing + walls
+            Collider midLandCol = CreateTunnelCollider(rampObj.transform, "CornerMidLandingCol", LocalToWorld(0f, midY - 0.05f, 0.14f), LocalScale(landHalf * 2f, 0.1f, 0.98f));
+            ConfigureFloorTeleportationArea(midLandCol.gameObject);
+            stairFloorColliders.Add(midLandCol);
+
+            GameObject lowSlope = new GameObject("CornerLowSlopeCol");
+            lowSlope.transform.SetParent(rampObj.transform, false);
+            lowSlope.transform.position = LocalToWorld(0f, midY * 0.5f - 0.04f, -0.85f);
+            float lowAng = Mathf.Atan2(midY, 1.15f) * Mathf.Rad2Deg;
+            lowSlope.transform.rotation = Quaternion.LookRotation(fwd, Vector3.up) * Quaternion.Euler(-lowAng, 0f, 0f);
+            BoxCollider lowSlopeBC = lowSlope.AddComponent<BoxCollider>();
+            lowSlopeBC.size = new Vector3(cellSize, 0.1f, Mathf.Sqrt(1.15f * 1.15f + midY * midY));
+            ConfigureFloorTeleportationArea(lowSlope);
+            stairFloorColliders.Add(lowSlopeBC);
+
+            GameObject highSlope = new GameObject("CornerHighSlopeCol");
+            highSlope.transform.SetParent(rampObj.transform, false);
+            highSlope.transform.position = LocalToWorld(turnSign * 1.0f, (midY + upperFloorY) * 0.5f - 0.04f, 0f);
+            float highAng = Mathf.Atan2(upperFloorY - midY, 1.0f) * Mathf.Rad2Deg;
+            highSlope.transform.rotation = Quaternion.LookRotation(turnSign * right, Vector3.up) * Quaternion.Euler(-highAng, 0f, 0f);
+            BoxCollider highSlopeBC = highSlope.AddComponent<BoxCollider>();
+            highSlopeBC.size = new Vector3(narrowCorridorWidth + nwt * 2f, 0.1f, Mathf.Sqrt(1.0f + (upperFloorY - midY) * (upperFloorY - midY)));
+            ConfigureFloorTeleportationArea(highSlope);
+            stairFloorColliders.Add(highSlopeBC);
+
+            CreateTunnelCollider(rampObj.transform, "CornerBackWallCol", LocalToWorld(0f, 2.0f, highWallOffset), LocalScale(cellSize, 4.0f, nwt));
+            CreateTunnelCollider(rampObj.transform, "CornerOuterWallCol", LocalToWorld(-turnSign * highWallOffset, 2.0f, 0.14f), LocalScale(nwt, 4.0f, 1.05f));
+            for (int sSide = -1; sSide <= 1; sSide += 2)
+            {
+                CreateTunnelCollider(rampObj.transform, $"CornerHighSideCol_{sSide}", LocalToWorld(turnSign * 1.0f, upperFloorY + 1.0f, sSide * highWallOffset), LocalScale(1.0f, 2.5f, nwt));
+            }
+        }
+
+        rampBreadcrumbMeshes[(r, c)] = rampCrumbs;
     }
 
     GameObject CreateCrumbPiece(Transform parent, string name, Vector3 cellWorldCenter, Vector3 localPos, Vector3 scale, Material mat)
@@ -1876,7 +2861,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         return go;
     }
 
-    void SpawnMarkerPrimitive(PrimitiveType type, int r, int c, float yHeight, string name)
+    Renderer SpawnMarkerPrimitive(PrimitiveType type, int r, int c, float yHeight, string name)
     {
         GameObject marker = GameObject.CreatePrimitive(type);
         marker.name = name;
@@ -1887,7 +2872,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         Vector3 markerScale = Vector3.one * (cellSize * 0.28f);
         marker.transform.localScale = markerScale;
         NormalizeMeshUVsToWorldSpacePosition(marker, type, worldPos, markerScale);
-        marker.GetComponent<Renderer>().sharedMaterial = blackBreadcrumbMaterial;
+        Renderer rend = marker.GetComponent<Renderer>();
+        rend.sharedMaterial = blackBreadcrumbMaterial;
+        return rend;
     }
 
     public void UpdateBreadcrumbsAnd2DMap()
@@ -1905,6 +2892,30 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 pieces[d].SetActive(occupied && (nibs & (1 << d)) != 0);
         }
 
+        foreach (var kvp in rampBreadcrumbMeshes)
+        {
+            var (r, c) = kvp.Key;
+            List<GameObject> pieces = kvp.Value;
+            bool occupied = ((MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BASE) |
+                              MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BASE)) & 0x30) != 0;
+            for (int i = 0; i < pieces.Count; i++)
+            {
+                if (pieces[i] != null) pieces[i].SetActive(occupied);
+            }
+        }
+
+        // Invert Start Sphere and Goal Cube between black (unoccupied) and white (when black breadcrumb path is present) to match 2D map!
+        if (startMarkerRenderer != null)
+        {
+            bool startOccupied = (MazeData.GetSquare(MazeData.StartPos.r, MazeData.StartPos.c, MazeData.StartPos.layer) & 0x30) != 0;
+            startMarkerRenderer.sharedMaterial = startOccupied ? whiteWallMaterial : blackBreadcrumbMaterial;
+        }
+        if (endMarkerRenderer != null)
+        {
+            bool endOccupied = (MazeData.GetSquare(MazeData.EndPos.r, MazeData.EndPos.c, MazeData.EndPos.layer) & 0x30) != 0;
+            endMarkerRenderer.sharedMaterial = endOccupied ? whiteWallMaterial : blackBreadcrumbMaterial;
+        }
+
         RenderEntireMaze2D();
     }
 
@@ -1912,7 +2923,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     {
         ForceEnableAllXRInputActions(xrRigRoot.gameObject);
 
-        xrRigRoot.position = CellToWorldCenter(MazeData.StartPos.r, MazeData.StartPos.c, 0.02f);
+        float startY = GetLayerBaseFloorY(MazeData.StartPos.layer);
+        xrRigRoot.position = CellToWorldCenter(MazeData.StartPos.r, MazeData.StartPos.c, startY + 0.02f);
 
         byte startMask = MazeData.GetSquare(MazeData.StartPos.r, MazeData.StartPos.c, MazeData.StartPos.layer);
         float startYaw = 0f;
@@ -2046,12 +3058,15 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 lastBuiltSkillLevel = skillLevel;
                 MazeData.MakeMaze(skillLevel);
                 RebuildMazeGeometryOnly();
+                IgnoreStairFloorCollisionsForPlayer();
+                RepositionPlayerAtStart();
                 UpdateNonEuclideanTunnelState();
                 UpdateBreadcrumbsAnd2DMap();
             }
             else if (architectureStyle != lastBuiltStyle && MazeData != null)
             {
                 RebuildMazeGeometryOnly();
+                IgnoreStairFloorCollisionsForPlayer();
                 UpdateNonEuclideanTunnelState();
                 UpdateBreadcrumbsAnd2DMap();
             }
@@ -2291,6 +3306,112 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 DrawOccupiedSubLayer(AmazingMazeData.LAYER_NARROW_BRIDGE);
             }
         }
+        else
+        {
+            // Draw 16x16 Macintosh Tapered Ramp (Straight or 90-Degree Corner)
+            int wideDir = 0, narrowDir = 2;
+            for (int d = 0; d < 4; d++)
+            {
+                if ((wBaseOpen & (1 << d)) != 0) wideDir = d;
+                if ((nBaseOpen & (1 << d)) != 0) narrowDir = d;
+            }
+            bool rampOccupied = ((wBase | nBase) & 0x30) != 0;
+
+            // Map canonical (u, v) in [0..15]x[0..15] where wide entrance is at v = 15 (DIR_DOWN)
+            void SetRampPixel(int u, int v, byte val)
+            {
+                int px, py;
+                switch (wideDir)
+                {
+                    case AmazingMazeData.DIR_DOWN:  px = u;      py = v;      break;
+                    case AmazingMazeData.DIR_UP:    px = 15 - u; py = 15 - v; break;
+                    case AmazingMazeData.DIR_RIGHT: px = v;      py = 15 - u; break;
+                    case AmazingMazeData.DIR_LEFT:  px = 15 - v; py = u;      break;
+                    default:                        px = u;      py = v;      break;
+                }
+                SetPixelFB(ox + px, oy + py, val);
+            }
+
+            if (narrowDir == AmazingMazeData.DirOpp(wideDir))
+            {
+                // Straight Tapered Ramp: narrow on v=0..5, 45-degree diagonal taper on v=6..9, wide on v=10..15
+                for (int v = 0; v <= 15; v++)
+                {
+                    int uL, uR, cL, cR;
+                    if (v <= 5)
+                    {
+                        uL = 5; uR = 10;
+                        cL = 7; cR = 8;
+                    }
+                    else if (v <= 9)
+                    {
+                        int s = v - 5;
+                        uL = 5 - s; uR = 10 + s;
+                        cL = 7 - s; cR = 8 + s;
+                    }
+                    else
+                    {
+                        uL = 1; uR = 14;
+                        cL = 3; cR = 12;
+                    }
+
+                    SetRampPixel(uL, v, 1);
+                    SetRampPixel(uR, v, 1);
+                    for (int u = uL + 1; u <= uR - 1; u++)
+                        SetRampPixel(u, v, 0);
+
+                    if (rampOccupied)
+                    {
+                        for (int u = cL; u <= cR; u++)
+                            SetRampPixel(u, v, 1);
+                    }
+                }
+            }
+            else
+            {
+                // 90-Degree Corner Turning Ramp (Level 4)
+                // Determine if narrowDir is towards u=0 (left in canonical frame) or u=15 (right in canonical frame)
+                int leftOfWide = (wideDir + 1) & 3;
+                bool turnToZeroU = (narrowDir == leftOfWide);
+
+                void SetCornerPixel(int u0, int v, byte val)
+                {
+                    int u = turnToZeroU ? u0 : (15 - u0);
+                    SetRampPixel(u, v, val);
+                }
+
+                // Wide lower half (v = 10..15)
+                for (int v = 10; v <= 15; v++)
+                {
+                    SetCornerPixel(1, v, 1);
+                    SetCornerPixel(14, v, 1);
+                    for (int u = 2; u <= 13; u++) SetCornerPixel(u, v, 0);
+                    if (rampOccupied)
+                    {
+                        for (int u = 3; u <= 12; u++) SetCornerPixel(u, v, 1);
+                    }
+                }
+
+                // Corner transition & narrow exit (v = 5..9)
+                for (int u = 0; u <= 10; u++) SetCornerPixel(u, 5, 1);
+                SetCornerPixel(1, 10, 1);
+                for (int v = 6; v <= 9; v++)
+                {
+                    int s = v - 5;
+                    int uOuter = 10 + s;
+                    for (int u = 0; u < uOuter; u++) SetCornerPixel(u, v, 0);
+                    SetCornerPixel(uOuter, v, 1);
+                    if (v == 9) SetCornerPixel(0, 10, 1);
+
+                    if (rampOccupied)
+                    {
+                        int cR = 8 + s;
+                        int cL = (v <= 8) ? 0 : 3;
+                        for (int u = cL; u <= cR; u++) SetCornerPixel(u, v, 1);
+                    }
+                }
+            }
+        }
 
         if (r == MazeData.EndPos.r && c == MazeData.EndPos.c)
         {
@@ -2446,8 +3567,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         cc.radius = 0.35f;
         cc.height = 1.7f;
         cc.center = new Vector3(0f, 0.85f, 0f);
+        cc.stepOffset = 0.50f;
+        cc.slopeLimit = 60f;
 
-        playerObject.transform.position = CellToWorldCenter(MazeData.StartPos.r, MazeData.StartPos.c, 0.05f);
+        float startY = GetLayerBaseFloorY(MazeData.StartPos.layer);
+        playerObject.transform.position = CellToWorldCenter(MazeData.StartPos.r, MazeData.StartPos.c, startY + 0.05f);
 
         byte startMask = MazeData.GetSquare(MazeData.StartPos.r, MazeData.StartPos.c, MazeData.StartPos.layer);
         float startYaw = 0f;
@@ -2533,7 +3657,19 @@ public class SimpleDesktopMazeWalker : MonoBehaviour
         float h = Input.GetAxisRaw("Horizontal");
         float v = Input.GetAxisRaw("Vertical");
         Vector3 move = (transform.right * h + transform.forward * v).normalized * speed;
-        cc.SimpleMove(move);
+        cc.Move(move * Time.deltaTime);
+
+        float targetY = builder.GetTargetPlayerFloorY(transform.position) + 0.05f;
+        Vector3 pos = transform.position;
+        float nextY = Mathf.Lerp(pos.y, targetY, Mathf.Clamp01(Time.deltaTime * 18f));
+        if (Mathf.Abs(nextY - pos.y) > 0.0005f)
+        {
+            pos.y = nextY;
+            cc.enabled = false;
+            transform.position = pos;
+            Physics.SyncTransforms();
+            cc.enabled = true;
+        }
 #endif
     }
 }
