@@ -1507,11 +1507,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         GameObject baseColliderFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
         baseColliderFloor.name = "BridgeTeleportFloor";
         baseColliderFloor.transform.SetParent(bridgeRoot.transform, false);
-        float floorSlabThick = isNarrowPlane ? 0.08f : 0.1f;
+        float floorSlabThick = isNarrowPlane ? 0.12f : 0.1f;
         baseColliderFloor.transform.localPosition = new Vector3(0f, -(floorSlabThick * 0.5f + 0.002f), 0f);
-        Vector3 floorScale = isNarrowPlane ? new Vector3(fullTunnelLen, floorSlabThick, fullTunnelLen) : new Vector3(cellSize, floorSlabThick, cellSize);
+        Vector3 floorScale = isNarrowPlane ? new Vector3(innerSpan, floorSlabThick, innerSpan) : new Vector3(cellSize, floorSlabThick, cellSize);
         baseColliderFloor.transform.localScale = floorScale;
-        NormalizeMeshUVsToWorldSpacePosition(baseColliderFloor, PrimitiveType.Cube, center + new Vector3(0f, -0.052f, 0f), floorScale);
+        NormalizeMeshUVsToWorldSpacePosition(baseColliderFloor, PrimitiveType.Cube, center + new Vector3(0f, -(floorSlabThick * 0.5f + 0.002f), 0f), floorScale);
         baseColliderFloor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
         ConfigureFloorTeleportationArea(baseColliderFloor);
 
@@ -1627,7 +1627,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         float armMid = outerHW + armLen * 0.5f;
         float nwh = narrowWallHeight;
         float ew = blackEdgeOutlineWidth;
-        float floorThick = 0.08f;
+        float floorThick = 0.12f;
+        float fullWallH = nwh + floorThick;
+        float wallMidY = (nwh - floorThick) * 0.5f;
+        float pillarH = doorH + floorThick;
+        float pillarMidY = (doorH - floorThick) * 0.5f;
 
         if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
         {
@@ -1636,16 +1640,22 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 for (int sz = -1; sz <= 1; sz += 2)
                 {
                     Vector3 pPos = center + new Vector3(sx * half, 0f, sz * half);
-                    CreateWallBoxWithMaterial(parent, $"NarrowArchPillar_{sx}_{sz}", pPos + new Vector3(0f, doorH * 0.5f, 0f), new Vector3(nwt, doorH, nwt), whiteWallMaterial);
+                    CreateWallBoxWithMaterial(parent, $"NarrowArchPillar_{sx}_{sz}", pPos + new Vector3(0f, pillarMidY, 0f), new Vector3(nwt, pillarH, nwt), whiteWallMaterial);
 
+                    // Transverse horizontal edge bars at height nwh where low approach walls butt against the pillar
                     CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(0f, nwh, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
                     CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, nwh, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
 
-                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(0f, ew * 0.5f, -sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
-                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(-sx * halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
+                    // Exterior bottom edge bars at -floorThick so the bottom outline continues seamlessly across the pillar
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(0f, -floorThick, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, -floorThick, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
 
-                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, th * 0.5f, sz * halfWT), new Vector3(ew, th + ew, ew), blackEdgeMaterial);
+                    // Outer vertical corner bar extending from -floorThick all the way to the roof top (th)
+                    float fullCornerH = th + floorThick;
+                    float fullCornerMidY = (th - floorThick) * 0.5f;
+                    CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, fullCornerMidY, sz * halfWT), new Vector3(ew, fullCornerH + ew, ew), blackEdgeMaterial);
 
+                    // Vertical doorway jamb bars above the approach wall (nwh .. doorH)
                     float jambSegH = doorH - nwh;
                     float jambMidY = nwh + jambSegH * 0.5f;
                     CreateBlackEdgeBarWithMaterial(parent, pPos + new Vector3(sx * halfWT, jambMidY, -sz * halfWT), new Vector3(ew, jambSegH + ew, ew), blackEdgeMaterial);
@@ -1654,27 +1664,31 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             }
         }
 
+        float armFloorLen = halfCell - (half - halfWT);
+        float armFloorMid = (half - halfWT) + armFloorLen * 0.5f;
+
         for (int dir = 0; dir < 4; dir++)
         {
             bool alongZ = (dir == AmazingMazeData.DIR_UP || dir == AmazingMazeData.DIR_DOWN);
             float sign = (dir == AmazingMazeData.DIR_UP || dir == AmazingMazeData.DIR_RIGHT) ? 1f : -1f;
 
             Vector3 armCenter = center + (alongZ ? new Vector3(0f, 0f, sign * armMid) : new Vector3(sign * armMid, 0f, 0f));
-            Vector3 fScale = alongZ ? new Vector3(outerHW * 2f, floorThick, armLen) : new Vector3(armLen, floorThick, outerHW * 2f);
+            Vector3 armFloorPos = center + (alongZ ? new Vector3(0f, -floorThick * 0.5f, sign * armFloorMid) : new Vector3(sign * armFloorMid, -floorThick * 0.5f, 0f));
+            Vector3 fScale = alongZ ? new Vector3(innerSpan, floorThick, armFloorLen) : new Vector3(armFloorLen, floorThick, innerSpan);
 
             GameObject armFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
             armFloor.name = $"NarrowBridgeApproachFloor_{dir}";
             armFloor.transform.SetParent(parent, false);
-            armFloor.transform.position = armCenter + new Vector3(0f, -floorThick * 0.5f, 0f);
+            armFloor.transform.position = armFloorPos;
             armFloor.transform.localScale = fScale;
-            NormalizeMeshUVsToWorldSpacePosition(armFloor, PrimitiveType.Cube, armFloor.transform.position, fScale);
+            NormalizeMeshUVsToWorldSpacePosition(armFloor, PrimitiveType.Cube, armFloorPos, fScale);
             armFloor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
             ConfigureFloorTeleportationArea(armFloor);
 
             for (int side = -1; side <= 1; side += 2)
             {
-                Vector3 wallPos = armCenter + (alongZ ? new Vector3(side * half, nwh * 0.5f, 0f) : new Vector3(0f, nwh * 0.5f, side * half));
-                Vector3 wallScale = alongZ ? new Vector3(nwt, nwh, armLen) : new Vector3(armLen, nwh, nwt);
+                Vector3 wallPos = armCenter + (alongZ ? new Vector3(side * half, wallMidY, 0f) : new Vector3(0f, wallMidY, side * half));
+                Vector3 wallScale = alongZ ? new Vector3(nwt, fullWallH, armLen) : new Vector3(armLen, fullWallH, nwt);
                 CreateWallBoxWithMaterial(parent, "NarrowApproachWall", wallPos, wallScale, whiteWallMaterial);
 
                 Vector3 colPos = armCenter + (alongZ ? new Vector3(side * half, 1.5f, 0f) : new Vector3(0f, 1.5f, side * half));
@@ -1682,17 +1696,21 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
                 if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
                 {
-                    for (int fSide = -1; fSide <= 1; fSide += 2)
-                    {
-                        Vector3 topBar = armCenter + (alongZ ? new Vector3(side * half + fSide * halfWT, nwh, 0f) : new Vector3(0f, nwh, side * half + fSide * halfWT));
-                        Vector3 botBar = armCenter + (alongZ ? new Vector3(side * half + fSide * halfWT, ew * 0.5f, 0f) : new Vector3(0f, ew * 0.5f, side * half + fSide * halfWT));
-                        Vector3 barScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
-                        CreateBlackEdgeBarWithMaterial(parent, topBar, barScale, blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(parent, botBar, barScale, blackEdgeMaterial);
-                    }
-                    Vector3 underBar = armCenter + (alongZ ? new Vector3(side * outerHW, -floorThick, 0f) : new Vector3(0f, -floorThick, side * outerHW));
-                    Vector3 underScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
-                    CreateBlackEdgeBarWithMaterial(parent, underBar, underScale, blackEdgeMaterial);
+                    Vector3 barScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
+                    float innerCoord = side * (half - halfWT);
+                    float outerCoord = side * outerHW;
+
+                    // Inner walkway face: top bar at nwh and floor crease bar at ew * 0.5f
+                    Vector3 innerTop = armCenter + (alongZ ? new Vector3(innerCoord, nwh, 0f) : new Vector3(0f, nwh, innerCoord));
+                    Vector3 innerBot = armCenter + (alongZ ? new Vector3(innerCoord, ew * 0.5f, 0f) : new Vector3(0f, ew * 0.5f, innerCoord));
+                    CreateBlackEdgeBarWithMaterial(parent, innerTop, barScale, blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(parent, innerBot, barScale, blackEdgeMaterial);
+
+                    // Outer exterior face: top bar at nwh and bottom bar at -floorThick (NO mid-seam bar at y=0!)
+                    Vector3 outerTop = armCenter + (alongZ ? new Vector3(outerCoord, nwh, 0f) : new Vector3(0f, nwh, outerCoord));
+                    Vector3 outerBot = armCenter + (alongZ ? new Vector3(outerCoord, -floorThick, 0f) : new Vector3(0f, -floorThick, outerCoord));
+                    CreateBlackEdgeBarWithMaterial(parent, outerTop, barScale, blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(parent, outerBot, barScale, blackEdgeMaterial);
                 }
             }
         }
@@ -2299,23 +2317,28 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         cellObj.transform.position = center;
 
         float innerW = narrowCorridorWidth;
+        float innerHW = innerW * 0.5f;
         float nwt = narrowWallThickness;
         float halfWT = nwt * 0.5f;
         float nwh = narrowWallHeight;
         float halfWall = (innerW + nwt) * 0.5f;
-        float outerHW = innerW * 0.5f + nwt;
+        float outerHW = innerHW + nwt;
         float outerW = outerHW * 2f;
         float armLen = cellSize * 0.5f - outerHW;
         float armMid = outerHW + armLen * 0.5f;
+        float armFloorLen = cellSize * 0.5f - innerHW;
+        float armFloorMid = innerHW + armFloorLen * 0.5f;
         float floorThick = 0.12f;
+        float fullWallH = nwh + floorThick;
+        float wallMidY = (nwh - floorThick) * 0.5f;
         float ew = blackEdgeOutlineWidth;
 
-        // 1. Center junction floor slab
+        // 1. Center junction floor slab (spans innerW x innerW between the walls so exterior wall faces have zero z-fighting)
         GameObject centerFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
         centerFloor.name = "NarrowCenterFloor";
         centerFloor.transform.SetParent(cellObj.transform, false);
         centerFloor.transform.position = center + new Vector3(0f, -floorThick * 0.5f, 0f);
-        Vector3 cfScale = new Vector3(outerW, floorThick, outerW);
+        Vector3 cfScale = new Vector3(innerW, floorThick, innerW);
         centerFloor.transform.localScale = cfScale;
         NormalizeMeshUVsToWorldSpacePosition(centerFloor, PrimitiveType.Cube, centerFloor.transform.position, cfScale);
         centerFloor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
@@ -2326,61 +2349,51 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         bool openW = (nBaseOpen & (1 << AmazingMazeData.DIR_LEFT)) != 0;
         bool openE = (nBaseOpen & (1 << AmazingMazeData.DIR_RIGHT)) != 0;
 
-        // 2. 4 Corner Posts around the center junction
+        // 2. 4 Corner Posts around the center junction (extending from -floorThick to +nwh)
         for (int sx = -1; sx <= 1; sx += 2)
         {
             for (int sz = -1; sz <= 1; sz += 2)
             {
                 Vector3 pPos = center + new Vector3(sx * halfWall, 0f, sz * halfWall);
-                CreateWallBoxWithMaterial(cellObj.transform, $"NarrowPost_{sx}_{sz}", pPos + new Vector3(0f, nwh * 0.5f, 0f), new Vector3(nwt, nwh, nwt), whiteWallMaterial);
+                CreateWallBoxWithMaterial(cellObj.transform, $"NarrowPost_{sx}_{sz}", pPos + new Vector3(0f, wallMidY, 0f), new Vector3(nwt, fullWallH, nwt), whiteWallMaterial);
 
                 if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
                 {
                     bool openX = (sx == 1) ? openE : openW;
                     bool openZ = (sz == 1) ? openN : openS;
 
-                    bool attachPosX = openX;
-                    bool attachNegX = !openZ;
-                    bool attachPosZ = openZ;
-                    bool attachNegZ = !openX;
-
-                    if (!attachPosX)
+                    // Outer +sx face (exposed when !openX): top bar at nwh and bottom bar at -floorThick (NO mid-seam bar at y=0!)
+                    if (!openX)
                     {
                         CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(sx * halfWT, nwh, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(sx * halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(sx * halfWT, -floorThick, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
                     }
-                    if (!attachNegX)
+                    // Inner -sx face (exposed onto the openZ walkway when openZ is true): top bar at nwh and inner floor bar at ew * 0.5f
+                    if (openZ)
                     {
                         CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(-sx * halfWT, nwh, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
                         CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(-sx * halfWT, ew * 0.5f, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
                     }
-                    if (!attachPosZ)
+                    // Outer +sz face (exposed when !openZ): top bar at nwh and bottom bar at -floorThick (NO mid-seam bar at y=0!)
+                    if (!openZ)
                     {
                         CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, nwh, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, ew * 0.5f, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, -floorThick, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
                     }
-                    if (!attachNegZ)
+                    // Inner -sz face (exposed onto the openX walkway when openX is true): top bar at nwh and inner floor bar at ew * 0.5f
+                    if (openX)
                     {
                         CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, nwh, -sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
                         CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, ew * 0.5f, -sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
                     }
 
-                    if (!openX)
-                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(sx * halfWT, -floorThick, 0f), new Vector3(ew, ew, nwt + ew), blackEdgeMaterial);
-                    if (!openZ)
-                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(0f, -floorThick, sz * halfWT), new Vector3(nwt + ew, ew, ew), blackEdgeMaterial);
-
-                    for (int qx = -1; qx <= 1; qx += 2)
+                    // Vertical corner bars: only exist when openX == openZ (either both closed = corner/dead-end, or both open = L-turn/intersection)
+                    if (openX == openZ)
                     {
-                        for (int qz = -1; qz <= 1; qz += 2)
-                        {
-                            bool wallAlongX = (qx == sx) ? attachPosX : attachNegX;
-                            bool wallAlongZ = (qz == sz) ? attachPosZ : attachNegZ;
-                            if (wallAlongX == wallAlongZ)
-                            {
-                                CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(qx * halfWT, nwh * 0.5f, qz * halfWT), new Vector3(ew, nwh + ew, ew), blackEdgeMaterial);
-                            }
-                        }
+                        // Outer corner at (+sx * halfWT, +sz * halfWT) extends from -floorThick to +nwh
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(sx * halfWT, wallMidY, sz * halfWT), new Vector3(ew, fullWallH + ew, ew), blackEdgeMaterial);
+                        // Inner walkway corner at (-sx * halfWT, -sz * halfWT) extends from 0 to +nwh
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, pPos + new Vector3(-sx * halfWT, nwh * 0.5f, -sz * halfWT), new Vector3(ew, nwh + ew, ew), blackEdgeMaterial);
                     }
                 }
             }
@@ -2396,21 +2409,22 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             if (isOpen)
             {
                 Vector3 armCenter = center + (alongZ ? new Vector3(0f, 0f, sign * armMid) : new Vector3(sign * armMid, 0f, 0f));
-                Vector3 fScale = alongZ ? new Vector3(outerW, floorThick, armLen) : new Vector3(armLen, floorThick, outerW);
+                Vector3 armFloorPos = center + (alongZ ? new Vector3(0f, -floorThick * 0.5f, sign * armFloorMid) : new Vector3(sign * armFloorMid, -floorThick * 0.5f, 0f));
+                Vector3 fScale = alongZ ? new Vector3(innerW, floorThick, armFloorLen) : new Vector3(armFloorLen, floorThick, innerW);
 
                 GameObject armFloor = GameObject.CreatePrimitive(PrimitiveType.Cube);
                 armFloor.name = $"NarrowArmFloor_{dir}";
                 armFloor.transform.SetParent(cellObj.transform, false);
-                armFloor.transform.position = armCenter + new Vector3(0f, -floorThick * 0.5f, 0f);
+                armFloor.transform.position = armFloorPos;
                 armFloor.transform.localScale = fScale;
-                NormalizeMeshUVsToWorldSpacePosition(armFloor, PrimitiveType.Cube, armFloor.transform.position, fScale);
+                NormalizeMeshUVsToWorldSpacePosition(armFloor, PrimitiveType.Cube, armFloorPos, fScale);
                 armFloor.GetComponent<Renderer>().sharedMaterial = whiteFloorMaterial;
                 ConfigureFloorTeleportationArea(armFloor);
 
                 for (int side = -1; side <= 1; side += 2)
                 {
-                    Vector3 wallPos = armCenter + (alongZ ? new Vector3(side * halfWall, nwh * 0.5f, 0f) : new Vector3(0f, nwh * 0.5f, side * halfWall));
-                    Vector3 wallScale = alongZ ? new Vector3(nwt, nwh, armLen) : new Vector3(armLen, nwh, nwt);
+                    Vector3 wallPos = armCenter + (alongZ ? new Vector3(side * halfWall, wallMidY, 0f) : new Vector3(0f, wallMidY, side * halfWall));
+                    Vector3 wallScale = alongZ ? new Vector3(nwt, fullWallH, armLen) : new Vector3(armLen, fullWallH, nwt);
                     CreateWallBoxWithMaterial(cellObj.transform, "NarrowArmSideWall", wallPos, wallScale, whiteWallMaterial);
 
                     Vector3 colPos = armCenter + (alongZ ? new Vector3(side * halfWall, 1.5f, 0f) : new Vector3(0f, 1.5f, side * halfWall));
@@ -2418,41 +2432,47 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
                     if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
                     {
-                        for (int fSide = -1; fSide <= 1; fSide += 2)
-                        {
-                            Vector3 topBar = armCenter + (alongZ ? new Vector3(side * halfWall + fSide * halfWT, nwh, 0f) : new Vector3(0f, nwh, side * halfWall + fSide * halfWT));
-                            Vector3 botBar = armCenter + (alongZ ? new Vector3(side * halfWall + fSide * halfWT, ew * 0.5f, 0f) : new Vector3(0f, ew * 0.5f, side * halfWall + fSide * halfWT));
-                            Vector3 barScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
-                            CreateBlackEdgeBarWithMaterial(cellObj.transform, topBar, barScale, blackEdgeMaterial);
-                            CreateBlackEdgeBarWithMaterial(cellObj.transform, botBar, barScale, blackEdgeMaterial);
-                        }
-                        Vector3 underBar = armCenter + (alongZ ? new Vector3(side * outerHW, -floorThick, 0f) : new Vector3(0f, -floorThick, side * outerHW));
-                        Vector3 underScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
-                        CreateBlackEdgeBarWithMaterial(cellObj.transform, underBar, underScale, blackEdgeMaterial);
+                        Vector3 barScale = alongZ ? new Vector3(ew, ew, armLen + ew) : new Vector3(armLen + ew, ew, ew);
+                        float innerCoord = side * innerHW;
+                        float outerCoord = side * outerHW;
+
+                        // Inner walkway face: top bar at nwh and floor crease bar at ew * 0.5f
+                        Vector3 innerTop = armCenter + (alongZ ? new Vector3(innerCoord, nwh, 0f) : new Vector3(0f, nwh, innerCoord));
+                        Vector3 innerBot = armCenter + (alongZ ? new Vector3(innerCoord, ew * 0.5f, 0f) : new Vector3(0f, ew * 0.5f, innerCoord));
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, innerTop, barScale, blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, innerBot, barScale, blackEdgeMaterial);
+
+                        // Outer exterior face: top bar at nwh and bottom bar at -floorThick (NO mid-seam bar at y=0!)
+                        Vector3 outerTop = armCenter + (alongZ ? new Vector3(outerCoord, nwh, 0f) : new Vector3(0f, nwh, outerCoord));
+                        Vector3 outerBot = armCenter + (alongZ ? new Vector3(outerCoord, -floorThick, 0f) : new Vector3(0f, -floorThick, outerCoord));
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, outerTop, barScale, blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(cellObj.transform, outerBot, barScale, blackEdgeMaterial);
                     }
                 }
             }
             else
             {
                 Vector3 closeMid = center + (alongZ ? new Vector3(0f, 0f, sign * halfWall) : new Vector3(sign * halfWall, 0f, 0f));
-                Vector3 closeScale = alongZ ? new Vector3(innerW, nwh, nwt) : new Vector3(nwt, nwh, innerW);
-                CreateWallBoxWithMaterial(cellObj.transform, $"NarrowCloseWall_{dir}", closeMid + new Vector3(0f, nwh * 0.5f, 0f), closeScale, whiteWallMaterial);
+                Vector3 closeScale = alongZ ? new Vector3(innerW, fullWallH, nwt) : new Vector3(nwt, fullWallH, innerW);
+                CreateWallBoxWithMaterial(cellObj.transform, $"NarrowCloseWall_{dir}", closeMid + new Vector3(0f, wallMidY, 0f), closeScale, whiteWallMaterial);
 
                 CreateTunnelCollider(cellObj.transform, $"NarrowCloseCol_{dir}", closeMid + new Vector3(0f, 1.5f, 0f), alongZ ? new Vector3(outerW, 3.0f, nwt) : new Vector3(nwt, 3.0f, outerW));
 
                 if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
                 {
-                    for (int fSide = -1; fSide <= 1; fSide += 2)
-                    {
-                        Vector3 topBar = closeMid + (alongZ ? new Vector3(0f, nwh, fSide * halfWT) : new Vector3(fSide * halfWT, nwh, 0f));
-                        Vector3 botBar = closeMid + (alongZ ? new Vector3(0f, ew * 0.5f, fSide * halfWT) : new Vector3(fSide * halfWT, ew * 0.5f, 0f));
-                        Vector3 barScale = alongZ ? new Vector3(innerW + ew, ew, ew) : new Vector3(ew, ew, innerW + ew);
-                        CreateBlackEdgeBarWithMaterial(cellObj.transform, topBar, barScale, blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(cellObj.transform, botBar, barScale, blackEdgeMaterial);
-                    }
-                    Vector3 underBar = closeMid + (alongZ ? new Vector3(0f, -floorThick, sign * halfWT) : new Vector3(sign * halfWT, -floorThick, 0f));
-                    Vector3 underScale = alongZ ? new Vector3(innerW + ew, ew, ew) : new Vector3(ew, ew, innerW + ew);
-                    CreateBlackEdgeBarWithMaterial(cellObj.transform, underBar, underScale, blackEdgeMaterial);
+                    Vector3 barScale = alongZ ? new Vector3(innerW + ew, ew, ew) : new Vector3(ew, ew, innerW + ew);
+
+                    // Inner walkway face (-sign * halfWT): top bar at nwh and floor crease bar at ew * 0.5f
+                    Vector3 innerTop = closeMid + (alongZ ? new Vector3(0f, nwh, -sign * halfWT) : new Vector3(-sign * halfWT, nwh, 0f));
+                    Vector3 innerBot = closeMid + (alongZ ? new Vector3(0f, ew * 0.5f, -sign * halfWT) : new Vector3(-sign * halfWT, ew * 0.5f, 0f));
+                    CreateBlackEdgeBarWithMaterial(cellObj.transform, innerTop, barScale, blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(cellObj.transform, innerBot, barScale, blackEdgeMaterial);
+
+                    // Outer exterior face (+sign * halfWT): top bar at nwh and bottom bar at -floorThick (NO mid-seam bar at y=0!)
+                    Vector3 outerTop = closeMid + (alongZ ? new Vector3(0f, nwh, sign * halfWT) : new Vector3(sign * halfWT, nwh, 0f));
+                    Vector3 outerBot = closeMid + (alongZ ? new Vector3(0f, -floorThick, sign * halfWT) : new Vector3(sign * halfWT, -floorThick, 0f));
+                    CreateBlackEdgeBarWithMaterial(cellObj.transform, outerTop, barScale, blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(cellObj.transform, outerBot, barScale, blackEdgeMaterial);
                 }
             }
         }
@@ -2509,7 +2529,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         float halfNWT = nwt * 0.5f;
         float nwh = narrowWallHeight;
         float ew = blackEdgeOutlineWidth;
-        float halfWideInner = (cellSize - wt) * 0.5f;
+        float wideWallCenterU = cellSize * 0.5f;
+        float halfWideInner = wideWallCenterU - halfWT;
         float halfNarrowInner = narrowCorridorWidth * 0.5f;
 
         List<GameObject> rampCrumbs = new List<GameObject>();
@@ -2525,19 +2546,19 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             Vector3 lowFloorScale = LocalScale(cellSize, 0.1f, lowLandingLen);
             CreateWallBoxWithMaterial(rampObj.transform, "RampLowerLanding", lowFloorPos, lowFloorScale, whiteFloorMaterial);
 
-            // Wide side wall stubs connecting flush with the vertex corner posts at s = -1.50 + halfWT
+            // Wide side wall stubs centered at wideWallCenterU (+/-1.50m) so they connect 100% flush with CornerPost and wide walls
             float stubLen = lowLandingLen - halfWT;
             float stubMidS = -cellSize * 0.5f + halfWT + stubLen * 0.5f;
             for (int side = -1; side <= 1; side += 2)
             {
-                Vector3 stubPos = LocalToWorld(side * halfWideInner, wh * 0.5f, stubMidS);
+                Vector3 stubPos = LocalToWorld(side * wideWallCenterU, wh * 0.5f, stubMidS);
                 CreateWallBoxWithMaterial(rampObj.transform, "RampWideStubWall", stubPos, LocalScale(wt, wh, stubLen), whiteWallMaterial);
                 if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
                 {
                     for (int fSide = -1; fSide <= 1; fSide += 2)
                     {
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * halfWideInner + fSide * halfWT, wh, stubMidS), LocalScale(ew, ew, stubLen + ew), blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * halfWideInner + fSide * halfWT, ew * 0.5f, stubMidS), LocalScale(ew, ew, stubLen + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * wideWallCenterU + fSide * halfWT, wh, stubMidS), LocalScale(ew, ew, stubLen + ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * wideWallCenterU + fSide * halfWT, ew * 0.5f, stubMidS), LocalScale(ew, ew, stubLen + ew), blackEdgeMaterial);
                     }
                 }
             }
@@ -2546,30 +2567,39 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             float crumbWide = cellSize * 0.625f;
             rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, "RampCrumb_Low", cellCenter, LocalToWorld(0f, 0.008f, lowLandingMidS) - cellCenter, LocalScale(crumbWide, 0.015f, lowLandingLen), blackBreadcrumbMaterial));
 
-            // 2. 10 Tapered Steps (s in [-1.10, +1.10], rising from y = 0.24m to y = upperFloorY)
+            // 2. 10 Tapered Steps (s in [-1.10, +1.10], rising from y = stepRise to y = upperFloorY)
             int numSteps = 10;
             float stairStartS = -1.10f;
             float stairEndS = 1.10f;
             float stepDepth = (stairEndS - stairStartS) / numSteps;
             float stepRise = upperFloorY / numSteps;
+            float floorThick = 0.12f;
 
             for (int i = 0; i < numSteps; i++)
             {
                 float t = (i + 0.5f) / numSteps;
                 // Taper occurs sharply in the middle steps to match the 45-degree Macintosh taper
                 float taperT = Mathf.Clamp01((t - 0.15f) / 0.70f);
-                float curHalfInner = Mathf.Lerp(halfWideInner - halfWT, halfNarrowInner, taperT);
+                float curHalfInner = Mathf.Lerp(halfWideInner, halfNarrowInner, taperT);
                 float curWallThick = Mathf.Lerp(wt, nwt, taperT);
                 float curWallH = Mathf.Lerp(wh, nwh, taperT);
 
+                float prevT = (i - 0.5f) / numSteps;
+                float prevTaperT = (i == 0) ? 0f : Mathf.Clamp01((prevT - 0.15f) / 0.70f);
+                float prevHalfInner = Mathf.Lerp(halfWideInner, halfNarrowInner, prevTaperT);
+                float prevWallThick = Mathf.Lerp(wt, nwt, prevTaperT);
+                float prevWallH = Mathf.Lerp(wh, nwh, prevTaperT);
+                float prevWTopY = i * stepRise + prevWallH;
+                float prevBotY = (i <= 0) ? 0f : Mathf.Max(0f, (i - 1) * stepRise - floorThick);
+
                 float stepMidS = stairStartS + (i + 0.5f) * stepDepth;
                 float stepTopY = (i + 1) * stepRise;
-                float stepBotY = Mathf.Max(0f, i * stepRise - 0.12f);
+                float stepBotY = Mathf.Max(0f, i * stepRise - floorThick);
                 float blockH = stepTopY - stepBotY;
 
-                // Step tread & riser block
+                // Step tread & riser block (spans inner width between the stepped side walls)
                 Vector3 stepPos = LocalToWorld(0f, stepBotY + blockH * 0.5f, stepMidS);
-                Vector3 stepScale = LocalScale((curHalfInner + curWallThick) * 2f, blockH, stepDepth + 0.005f);
+                Vector3 stepScale = LocalScale(curHalfInner * 2f, blockH, stepDepth + 0.005f);
                 CreateWallBoxWithMaterial(rampObj.transform, $"StairStep_{i}", stepPos, stepScale, whiteFloorMaterial);
 
                 // Front nose & riser bottom black outlines across the step tread
@@ -2600,18 +2630,45 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                         // Top horizontal bars on inner & outer faces of the stepped parapet
                         CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, wTopY, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
                         CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, wTopY, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
+                        // Bottom outer horizontal bar on the stepped underside
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, stepBotY + ew * 0.5f, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
                         // Step-to-wall inner crease bar
                         CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, stepTopY + ew * 0.5f, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
                         // Front top transverse cap bar on the step parapet riser
                         CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(wallCenterU, wTopY, frontS), LocalScale(curWallThick + ew, ew, ew), blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, wTopY - stepRise * 0.5f, frontS), LocalScale(ew, stepRise + ew, ew), blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, wTopY - stepRise * 0.5f, frontS), LocalScale(ew, stepRise + ew, ew), blackEdgeMaterial);
-                        // Vertical inner riser corner bars
+
+                        // Front vertical parapet riser bars connecting cleanly to the previous step's top (prevWTopY .. wTopY)
+                        float topRiserH = Mathf.Max(0.05f, wTopY - prevWTopY);
+                        float topRiserMidY = (wTopY + prevWTopY) * 0.5f;
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, topRiserMidY, frontS), LocalScale(ew, topRiserH + ew, ew), blackEdgeMaterial);
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, topRiserMidY, frontS), LocalScale(ew, topRiserH + ew, ew), blackEdgeMaterial);
+
+                        // Bottom outer vertical riser bar on the underside of the stepped wall
+                        if (stepBotY > prevBotY + 0.01f)
+                        {
+                            float botRiserH = stepBotY - prevBotY;
+                            float botRiserMidY = (stepBotY + prevBotY) * 0.5f;
+                            CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, botRiserMidY, frontS), LocalScale(ew, botRiserH + ew, ew), blackEdgeMaterial);
+                        }
+
+                        // Vertical inner tread riser corner bar (i * stepRise .. stepTopY)
                         CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, stepTopY - stepRise * 0.5f, frontS), LocalScale(ew, stepRise + ew, ew), blackEdgeMaterial);
+
+                        // On the final step (i == numSteps - 1), connect the underside stepBotY up to upperFloorY - floorThick at backS
+                        if (i == numSteps - 1)
+                        {
+                            float exitBotY = upperFloorY - floorThick;
+                            if (exitBotY > stepBotY + 0.01f)
+                            {
+                                float endRiserH = exitBotY - stepBotY;
+                                float endRiserMidY = (exitBotY + stepBotY) * 0.5f;
+                                CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, endRiserMidY, backS), LocalScale(ew, endRiserH + ew, ew), blackEdgeMaterial);
+                            }
+                        }
                     }
                 }
 
-                // Step breadcrumb strip on top of step i ( plus riser crumb so path looks continuous from any angle!)
+                // Step breadcrumb strip on top of step i (plus riser crumb so path looks continuous from any angle!)
                 float curCrumbW = Mathf.Lerp(crumbWide, cellSize * 0.25f, taperT);
                 rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, $"RampCrumb_Step_{i}", cellCenter, LocalToWorld(0f, stepTopY + 0.008f, stepMidS) - cellCenter, LocalScale(curCrumbW, 0.015f, stepDepth + 0.01f), blackBreadcrumbMaterial));
                 rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, $"RampCrumb_Riser_{i}", cellCenter, LocalToWorld(0f, stepTopY - stepRise * 0.5f, stairStartS + i * stepDepth - 0.006f) - cellCenter, LocalScale(curCrumbW, stepRise, 0.012f), blackBreadcrumbMaterial));
@@ -2620,52 +2677,50 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             // 3. Upper Narrow Exit Landing (s in [+1.10, +1.50])
             float highLandingLen = 0.40f;
             float highLandingMidS = cellSize * 0.5f - highLandingLen * 0.5f;
-            float floorThick = 0.12f;
             float outerNarrowW = narrowCorridorWidth + nwt * 2f;
+            float fullHighWallH = nwh + floorThick;
+            float highWallMidY = upperFloorY + (nwh - floorThick) * 0.5f;
             Vector3 highFloorPos = LocalToWorld(0f, upperFloorY - floorThick * 0.5f, highLandingMidS);
-            CreateWallBoxWithMaterial(rampObj.transform, "RampUpperLanding", highFloorPos, LocalScale(outerNarrowW, floorThick, highLandingLen), whiteFloorMaterial);
+            CreateWallBoxWithMaterial(rampObj.transform, "RampUpperLanding", highFloorPos, LocalScale(narrowCorridorWidth, floorThick, highLandingLen), whiteFloorMaterial);
 
             float highWallU = (narrowCorridorWidth + nwt) * 0.5f;
             for (int side = -1; side <= 1; side += 2)
             {
-                Vector3 hwPos = LocalToWorld(side * highWallU, upperFloorY + nwh * 0.5f, highLandingMidS);
-                CreateWallBoxWithMaterial(rampObj.transform, "RampNarrowExitWall", hwPos, LocalScale(nwt, nwh, highLandingLen), whiteWallMaterial);
+                Vector3 hwPos = LocalToWorld(side * highWallU, highWallMidY, highLandingMidS);
+                CreateWallBoxWithMaterial(rampObj.transform, "RampNarrowExitWall", hwPos, LocalScale(nwt, fullHighWallH, highLandingLen), whiteWallMaterial);
                 if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
                 {
-                    for (int fSide = -1; fSide <= 1; fSide += 2)
-                    {
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * highWallU + fSide * halfNWT, upperFloorY + nwh, highLandingMidS), LocalScale(ew, ew, highLandingLen + ew), blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * highWallU + fSide * halfNWT, upperFloorY + ew * 0.5f, highLandingMidS), LocalScale(ew, ew, highLandingLen + ew), blackEdgeMaterial);
-                    }
+                    float innerU = side * halfNarrowInner;
+                    float outerU = side * (halfNarrowInner + nwt);
+                    Vector3 barScale = LocalScale(ew, ew, highLandingLen + ew);
+
+                    // Inner walkway face: top bar at upperFloorY + nwh and floor bar at upperFloorY + ew * 0.5f
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, upperFloorY + nwh, highLandingMidS), barScale, blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, upperFloorY + ew * 0.5f, highLandingMidS), barScale, blackEdgeMaterial);
+
+                    // Outer exterior face: top bar at upperFloorY + nwh and bottom bar at upperFloorY - floorThick (NO mid-seam bar at upperFloorY!)
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, upperFloorY + nwh, highLandingMidS), barScale, blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, upperFloorY - floorThick, highLandingMidS), barScale, blackEdgeMaterial);
                 }
             }
 
             rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, "RampCrumb_High", cellCenter, LocalToWorld(0f, upperFloorY + 0.008f, highLandingMidS) - cellCenter, LocalScale(cellSize * 0.25f, 0.015f, highLandingLen), blackBreadcrumbMaterial));
 
-            // 4. Flanking Low Checkerboard Blocks on left/right of the narrowed upper half + ground-level back wall
-            float flankW = (cellSize - outerNarrowW) * 0.5f;
-            float flankMidU = outerNarrowW * 0.5f + flankW * 0.5f;
-            float flankLen = 1.60f;
-            float flankMidS = cellSize * 0.5f - flankLen * 0.5f;
-            float chkH = Mathf.Max(0.1f, wh - 0.04f);
-            for (int side = -1; side <= 1; side += 2)
+            // 4. Ground-level checkerboard base pad under the tapered/narrowed section of the ramp cell
+            if (fillUnoccupiedWithCheckerboard)
             {
-                GameObject chk = GameObject.CreatePrimitive(PrimitiveType.Cube);
-                Destroy(chk.GetComponent<Collider>());
-                chk.transform.SetParent(rampObj.transform, false);
-                Vector3 chkPos = LocalToWorld(side * flankMidU, chkH * 0.5f - 0.02f, flankMidS);
-                Vector3 chkScale = LocalScale(flankW, chkH, flankLen);
-                chk.transform.position = chkPos;
-                chk.transform.localScale = chkScale;
-                NormalizeMeshUVsToWorldSpacePosition(chk, PrimitiveType.Cube, chkPos, chkScale, checkerSquaresPerMeter * 0.5f);
-                chk.GetComponent<Renderer>().sharedMaterial = checkerboardMaterial;
-            }
-
-            // Ground-level closing wall on the back & left/right exterior boundaries so adjacent cells see clean walls
-            CreateWallBoxWithMaterial(rampObj.transform, "RampGroundBackWall", LocalToWorld(0f, wh * 0.5f, cellSize * 0.5f), LocalScale(cellSize - wt, wh, wt), whiteWallMaterial);
-            for (int side = -1; side <= 1; side += 2)
-            {
-                CreateWallBoxWithMaterial(rampObj.transform, "RampGroundSideWall", LocalToWorld(side * cellSize * 0.5f, wh * 0.5f, 0f), LocalScale(wt, wh, cellSize - wt), whiteWallMaterial);
+                float padLen = cellSize - lowLandingLen;
+                float padMidS = -cellSize * 0.5f + lowLandingLen + padLen * 0.5f;
+                GameObject chkPad = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                chkPad.name = "RampGroundCheckerPad";
+                Destroy(chkPad.GetComponent<Collider>());
+                chkPad.transform.SetParent(rampObj.transform, false);
+                Vector3 chkPos = LocalToWorld(0f, -0.05f, padMidS);
+                Vector3 chkScale = LocalScale(cellSize, 0.1f, padLen);
+                chkPad.transform.position = chkPos;
+                chkPad.transform.localScale = chkScale;
+                NormalizeMeshUVsToWorldSpacePosition(chkPad, PrimitiveType.Cube, chkPos, chkScale, checkerSquaresPerMeter * 0.5f);
+                chkPad.GetComponent<Renderer>().sharedMaterial = checkerboardMaterial;
             }
 
             // 5. Smooth Physics Colliders & Teleportation Surfaces for walking and teleporting up/down the straight tapered ramp
