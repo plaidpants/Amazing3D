@@ -162,12 +162,17 @@ MonoBehaviour:
   runSpeed: 7.2
   maxTeleportCellsPerJump: 6
   architectureStyle: 0
-  skillLevel: 1
+  skillLevel: 2
   cellSize: 3
   wallHeight: 0.85
   tunnelArchHeight: 2.4
   wallThickness: 0.35
   blackEdgeOutlineWidth: 0.03
+  upperFloorY: 2.4
+  narrowCorridorWidth: 1.26
+  narrowWallThickness: 0.24
+  narrowWallHeight: 0.65
+  narrowTunnelArchHeight: 2.05
   fillUnoccupiedWithCheckerboard: 1
   checkerSquaresPerMeter: 6
   useSquareMacintoshDots: 1

@@ -2169,6 +2169,98 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         bar.GetComponent<Renderer>().sharedMaterial = mat;
     }
 
+    void CreateEdgeBarBetweenPoints(Transform parent, Vector3 pA, Vector3 pB, float ew, Material mat)
+    {
+        Vector3 diff = pB - pA;
+        float len = diff.magnitude;
+        if (len < 0.001f) return;
+
+        GameObject bar = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        bar.name = "PhysicalSlopedEdge";
+        Destroy(bar.GetComponent<Collider>());
+        bar.transform.SetParent(parent, false);
+        bar.transform.position = (pA + pB) * 0.5f;
+        bar.transform.rotation = Quaternion.LookRotation(diff / len, Vector3.up);
+        bar.transform.localScale = new Vector3(ew, ew, len + ew);
+        bar.GetComponent<Renderer>().sharedMaterial = mat;
+    }
+
+    GameObject CreateSlopedTaperedWallMesh(
+        Transform parent,
+        string name,
+        Vector3 fIB, Vector3 fIT, Vector3 fOB, Vector3 fOT,
+        Vector3 bIB, Vector3 bIT, Vector3 bOB, Vector3 bOT,
+        Vector3 innerNormal, Vector3 outerNormal, Vector3 fwdDir,
+        Material mat)
+    {
+        GameObject go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+        go.transform.position = Vector3.zero;
+        go.transform.rotation = Quaternion.identity;
+
+        MeshFilter mf = go.AddComponent<MeshFilter>();
+        MeshRenderer mr = go.AddComponent<MeshRenderer>();
+        mr.sharedMaterial = mat;
+
+        List<Vector3> verts = new List<Vector3>(24);
+        List<Vector3> norms = new List<Vector3>(24);
+        List<Vector2> uvs   = new List<Vector2>(24);
+        List<int> tris      = new List<int>(36);
+
+        float uvPerMeter = 0.5f;
+
+        void AddQuadFace(Vector3 v0, Vector3 v1, Vector3 v2, Vector3 v3, Vector3 shadingNormal, Vector3 geomOutwardHint)
+        {
+            Vector3 geomN = Vector3.Cross(v1 - v0, v2 - v0);
+            if (Vector3.Dot(geomN, geomOutwardHint) < 0f)
+            {
+                Vector3 tmp = v1; v1 = v3; v3 = tmp;
+            }
+
+            int baseIdx = verts.Count;
+            verts.Add(v0); verts.Add(v1); verts.Add(v2); verts.Add(v3);
+
+            Vector3 n = shadingNormal.normalized;
+            for (int i = 0; i < 4; i++)
+            {
+                norms.Add(n);
+                Vector3 wp = verts[baseIdx + i];
+                if (Mathf.Abs(n.y) > 0.5f)
+                    uvs.Add(new Vector2(wp.x, wp.z) * uvPerMeter);
+                else if (Mathf.Abs(n.x) >= Mathf.Abs(n.z))
+                    uvs.Add(new Vector2(wp.z, wp.y) * uvPerMeter);
+                else
+                    uvs.Add(new Vector2(wp.x, wp.y) * uvPerMeter);
+            }
+
+            tris.Add(baseIdx + 0); tris.Add(baseIdx + 1); tris.Add(baseIdx + 2);
+            tris.Add(baseIdx + 0); tris.Add(baseIdx + 2); tris.Add(baseIdx + 3);
+        }
+
+        // 1. Flat Sloped Top Handrail Face (uses Vector3.up shading normal so it matches all other bright white wall tops)
+        AddQuadFace(fIT, fOT, bOT, bIT, Vector3.up, Vector3.up);
+        // 2. Flat Bottom Face on the floor
+        AddQuadFace(fIB, bIB, bOB, fOB, Vector3.down, Vector3.down);
+        // 3. Flat Inner Wall Face (facing the stairs)
+        AddQuadFace(fIB, fIT, bIT, bIB, innerNormal, innerNormal);
+        // 4. Flat Outer Wall Face (facing the exterior of the staircase)
+        AddQuadFace(fOB, bOB, bOT, fOT, outerNormal, outerNormal);
+        // 5. Front Vertical Cap Face at stairStartS
+        AddQuadFace(fIB, fOB, fOT, fIT, -fwdDir, -fwdDir);
+        // 6. Back Vertical Cap Face at stairEndS
+        AddQuadFace(bIB, bIT, bOT, bOB, fwdDir, fwdDir);
+
+        Mesh mesh = new Mesh { name = name + "_Mesh" };
+        mesh.SetVertices(verts);
+        mesh.SetNormals(norms);
+        mesh.SetUVs(0, uvs);
+        mesh.SetTriangles(tris, 0);
+        mesh.RecalculateBounds();
+        mf.sharedMesh = mesh;
+
+        return go;
+    }
+
     void CreateWallColliderWorld(Transform parent, Vector3 worldPos, Vector3 size)
     {
         GameObject colObj = new GameObject("WallCollider");
@@ -2567,117 +2659,117 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             float crumbWide = cellSize * 0.625f;
             rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, "RampCrumb_Low", cellCenter, LocalToWorld(0f, 0.008f, lowLandingMidS) - cellCenter, LocalScale(crumbWide, 0.015f, lowLandingLen), blackBreadcrumbMaterial));
 
-            // 2. 10 Tapered Steps (s in [-1.10, +1.10], rising from y = stepRise to y = upperFloorY)
+            // 2. Smooth Flat-Topped Sloped Handrail Side Walls (s in [-1.10, +1.10], extending solidly down to the floor y = 0)
             int numSteps = 10;
             float stairStartS = -1.10f;
             float stairEndS = 1.10f;
             float stepDepth = (stairEndS - stairStartS) / numSteps;
             float stepRise = upperFloorY / numSteps;
             float floorThick = 0.12f;
+            float outerNarrowW = narrowCorridorWidth + nwt * 2f;
 
-            for (int i = 0; i < numSteps; i++)
+            for (int side = -1; side <= 1; side += 2)
             {
-                float t = (i + 0.5f) / numSteps;
-                // Taper occurs sharply in the middle steps to match the 45-degree Macintosh taper
-                float taperT = Mathf.Clamp01((t - 0.15f) / 0.70f);
-                float curHalfInner = Mathf.Lerp(halfWideInner, halfNarrowInner, taperT);
-                float curWallThick = Mathf.Lerp(wt, nwt, taperT);
-                float curWallH = Mathf.Lerp(wh, nwh, taperT);
+                Vector3 fIB = LocalToWorld(side * halfWideInner, 0f, stairStartS);
+                Vector3 fIT = LocalToWorld(side * halfWideInner, wh, stairStartS);
+                Vector3 fOB = LocalToWorld(side * (halfWideInner + wt), 0f, stairStartS);
+                Vector3 fOT = LocalToWorld(side * (halfWideInner + wt), wh, stairStartS);
 
-                float prevT = (i - 0.5f) / numSteps;
-                float prevTaperT = (i == 0) ? 0f : Mathf.Clamp01((prevT - 0.15f) / 0.70f);
-                float prevHalfInner = Mathf.Lerp(halfWideInner, halfNarrowInner, prevTaperT);
-                float prevWallThick = Mathf.Lerp(wt, nwt, prevTaperT);
-                float prevWallH = Mathf.Lerp(wh, nwh, prevTaperT);
-                float prevWTopY = i * stepRise + prevWallH;
-                float prevBotY = (i <= 0) ? 0f : Mathf.Max(0f, (i - 1) * stepRise - floorThick);
+                Vector3 bIB = LocalToWorld(side * halfNarrowInner, 0f, stairEndS);
+                Vector3 bIT = LocalToWorld(side * halfNarrowInner, upperFloorY + nwh, stairEndS);
+                Vector3 bOB = LocalToWorld(side * (halfNarrowInner + nwt), 0f, stairEndS);
+                Vector3 bOT = LocalToWorld(side * (halfNarrowInner + nwt), upperFloorY + nwh, stairEndS);
 
-                float stepMidS = stairStartS + (i + 0.5f) * stepDepth;
-                float stepTopY = (i + 1) * stepRise;
-                float stepBotY = Mathf.Max(0f, i * stepRise - floorThick);
-                float blockH = stepTopY - stepBotY;
+                CreateSlopedTaperedWallMesh(
+                    rampObj.transform,
+                    $"StairSmoothSlopedWall_{side}",
+                    fIB, fIT, fOB, fOT,
+                    bIB, bIT, bOB, bOT,
+                    -side * right, side * right, fwd,
+                    whiteWallMaterial);
 
-                // Step tread & riser block (spans inner width between the stepped side walls)
-                Vector3 stepPos = LocalToWorld(0f, stepBotY + blockH * 0.5f, stepMidS);
-                Vector3 stepScale = LocalScale(curHalfInner * 2f, blockH, stepDepth + 0.005f);
-                CreateWallBoxWithMaterial(rampObj.transform, $"StairStep_{i}", stepPos, stepScale, whiteFloorMaterial);
-
-                // Front nose & riser bottom black outlines across the step tread
                 if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
                 {
-                    float frontS = stairStartS + i * stepDepth;
-                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, stepTopY, frontS), LocalScale(curHalfInner * 2f + ew, ew, ew), blackEdgeMaterial);
-                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, i * stepRise + ew * 0.5f, frontS), LocalScale(curHalfInner * 2f + ew, ew, ew), blackEdgeMaterial);
+                    // Sloped top inner & outer handrail edges (matching the blue lines!)
+                    CreateEdgeBarBetweenPoints(rampObj.transform, fIT, bIT, ew, blackEdgeMaterial);
+                    CreateEdgeBarBetweenPoints(rampObj.transform, fOT, bOT, ew, blackEdgeMaterial);
+
+                    // Outer floor-level bottom edge bar along y = 0
+                    CreateEdgeBarBetweenPoints(rampObj.transform, fOB + Vector3.up * (ew * 0.5f), bOB + Vector3.up * (ew * 0.5f), ew, blackEdgeMaterial);
+
+                    // Transverse top handrail creases at bottom (s = stairStartS, y = wh) and top (s = stairEndS, y = upperFloorY + nwh)
+                    CreateEdgeBarBetweenPoints(rampObj.transform, fIT, fOT, ew, blackEdgeMaterial);
+                    CreateEdgeBarBetweenPoints(rampObj.transform, bIT, bOT, ew, blackEdgeMaterial);
+
+                    // Vertical corner bars at front transition (s = stairStartS) and back transition (s = stairEndS)
+                    CreateEdgeBarBetweenPoints(rampObj.transform, fOB, fOT, ew, blackEdgeMaterial);
+                    CreateEdgeBarBetweenPoints(rampObj.transform, fIB, fIT, ew, blackEdgeMaterial);
+                    CreateEdgeBarBetweenPoints(rampObj.transform, bOB, bOT, ew, blackEdgeMaterial);
+                    CreateEdgeBarBetweenPoints(rampObj.transform, LocalToWorld(side * halfNarrowInner, upperFloorY, stairEndS), bIT, ew, blackEdgeMaterial);
                 }
+            }
 
-                // Tapered stepped parapet walls on left & right of each step
-                for (int side = -1; side <= 1; side += 2)
+            // Solid back wall at s = stairEndS closing the underside of the stairs from y = 0 up to upperFloorY - floorThick
+            float pedestalBackH = upperFloorY - floorThick;
+            CreateWallBoxWithMaterial(
+                rampObj.transform,
+                "RampPedestalBackWall",
+                LocalToWorld(0f, pedestalBackH * 0.5f, stairEndS - 0.02f),
+                LocalScale(outerNarrowW, pedestalBackH, 0.04f),
+                whiteWallMaterial);
+            if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+            {
+                CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, ew * 0.5f, stairEndS), LocalScale(outerNarrowW + ew, ew, ew), blackEdgeMaterial);
+                CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, pedestalBackH, stairEndS), LocalScale(outerNarrowW + ew, ew, ew), blackEdgeMaterial);
+            }
+
+            // 10 Solid Stair Steps between the two flat sloped side walls (extending all the way down to y = 0 so no stepped underside is ever visible)
+            for (int i = 0; i < numSteps; i++)
+            {
+                float t0 = (float)i / numSteps;
+                float t1 = (float)(i + 1) / numSteps;
+                float tMid = (i + 0.5f) / numSteps;
+
+                float uFront = Mathf.Lerp(halfWideInner, halfNarrowInner, t0);
+                float uBack  = Mathf.Lerp(halfWideInner, halfNarrowInner, t1);
+
+                float frontS = stairStartS + i * stepDepth;
+                float backS  = frontS + stepDepth;
+                float stepMidS = (frontS + backS) * 0.5f;
+                float stepTopY = (i + 1) * stepRise;
+
+                // Step block extends solidly from y = 0 to stepTopY and tucks 0.06m inside the solid side walls
+                Vector3 stepPos = LocalToWorld(0f, stepTopY * 0.5f, stepMidS);
+                Vector3 stepScale = LocalScale((uFront + 0.06f) * 2f, stepTopY, stepDepth + 0.005f);
+                CreateWallBoxWithMaterial(rampObj.transform, $"StairStep_{i}", stepPos, stepScale, whiteFloorMaterial);
+
+                // Step surface outlines (strictly on the walkable stair treads and risers between the two flat walls)
+                if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
                 {
-                    float wallCenterU = side * (curHalfInner + curWallThick * 0.5f);
-                    float wTopY = stepTopY + curWallH;
-                    float wHeight = wTopY - stepBotY;
-                    Vector3 wPos = LocalToWorld(wallCenterU, stepBotY + wHeight * 0.5f, stepMidS);
-                    Vector3 wScale = LocalScale(curWallThick, wHeight, stepDepth + 0.01f);
-                    CreateWallBoxWithMaterial(rampObj.transform, $"StairSideWall_{i}_{side}", wPos, wScale, whiteWallMaterial);
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, stepTopY, frontS), LocalScale(uFront * 2f + ew, ew, ew), blackEdgeMaterial);
+                    CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(0f, i * stepRise + ew * 0.5f, frontS), LocalScale(uFront * 2f + ew, ew, ew), blackEdgeMaterial);
 
-                    if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+                    for (int side = -1; side <= 1; side += 2)
                     {
-                        float innerU = side * curHalfInner;
-                        float outerU = side * (curHalfInner + curWallThick);
-                        float frontS = stairStartS + i * stepDepth;
-                        float backS = frontS + stepDepth;
-
-                        // Top horizontal bars on inner & outer faces of the stepped parapet
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, wTopY, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, wTopY, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
-                        // Bottom outer horizontal bar on the stepped underside
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, stepBotY + ew * 0.5f, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
-                        // Step-to-wall inner crease bar
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, stepTopY + ew * 0.5f, stepMidS), LocalScale(ew, ew, stepDepth + ew), blackEdgeMaterial);
-                        // Front top transverse cap bar on the step parapet riser
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(wallCenterU, wTopY, frontS), LocalScale(curWallThick + ew, ew, ew), blackEdgeMaterial);
-
-                        // Front vertical parapet riser bars connecting cleanly to the previous step's top (prevWTopY .. wTopY)
-                        float topRiserH = Mathf.Max(0.05f, wTopY - prevWTopY);
-                        float topRiserMidY = (wTopY + prevWTopY) * 0.5f;
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, topRiserMidY, frontS), LocalScale(ew, topRiserH + ew, ew), blackEdgeMaterial);
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, topRiserMidY, frontS), LocalScale(ew, topRiserH + ew, ew), blackEdgeMaterial);
-
-                        // Bottom outer vertical riser bar on the underside of the stepped wall
-                        if (stepBotY > prevBotY + 0.01f)
-                        {
-                            float botRiserH = stepBotY - prevBotY;
-                            float botRiserMidY = (stepBotY + prevBotY) * 0.5f;
-                            CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, botRiserMidY, frontS), LocalScale(ew, botRiserH + ew, ew), blackEdgeMaterial);
-                        }
-
-                        // Vertical inner tread riser corner bar (i * stepRise .. stepTopY)
-                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(innerU, stepTopY - stepRise * 0.5f, frontS), LocalScale(ew, stepRise + ew, ew), blackEdgeMaterial);
-
-                        // On the final step (i == numSteps - 1), connect the underside stepBotY up to upperFloorY - floorThick at backS
-                        if (i == numSteps - 1)
-                        {
-                            float exitBotY = upperFloorY - floorThick;
-                            if (exitBotY > stepBotY + 0.01f)
-                            {
-                                float endRiserH = exitBotY - stepBotY;
-                                float endRiserMidY = (exitBotY + stepBotY) * 0.5f;
-                                CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(outerU, endRiserMidY, backS), LocalScale(ew, endRiserH + ew, ew), blackEdgeMaterial);
-                            }
-                        }
+                        CreateBlackEdgeBarWithMaterial(rampObj.transform, LocalToWorld(side * uFront, stepTopY - stepRise * 0.5f, frontS), LocalScale(ew, stepRise + ew, ew), blackEdgeMaterial);
+                        CreateEdgeBarBetweenPoints(
+                            rampObj.transform,
+                            LocalToWorld(side * uFront, stepTopY + ew * 0.5f, frontS),
+                            LocalToWorld(side * uBack, stepTopY + ew * 0.5f, backS),
+                            ew,
+                            blackEdgeMaterial);
                     }
                 }
 
                 // Step breadcrumb strip on top of step i (plus riser crumb so path looks continuous from any angle!)
-                float curCrumbW = Mathf.Lerp(crumbWide, cellSize * 0.25f, taperT);
+                float curCrumbW = Mathf.Lerp(crumbWide, cellSize * 0.25f, tMid);
                 rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, $"RampCrumb_Step_{i}", cellCenter, LocalToWorld(0f, stepTopY + 0.008f, stepMidS) - cellCenter, LocalScale(curCrumbW, 0.015f, stepDepth + 0.01f), blackBreadcrumbMaterial));
-                rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, $"RampCrumb_Riser_{i}", cellCenter, LocalToWorld(0f, stepTopY - stepRise * 0.5f, stairStartS + i * stepDepth - 0.006f) - cellCenter, LocalScale(curCrumbW, stepRise, 0.012f), blackBreadcrumbMaterial));
+                rampCrumbs.Add(CreateCrumbPiece(rampObj.transform, $"RampCrumb_Riser_{i}", cellCenter, LocalToWorld(0f, stepTopY - stepRise * 0.5f, frontS - 0.006f) - cellCenter, LocalScale(curCrumbW, stepRise, 0.012f), blackBreadcrumbMaterial));
             }
 
             // 3. Upper Narrow Exit Landing (s in [+1.10, +1.50])
             float highLandingLen = 0.40f;
             float highLandingMidS = cellSize * 0.5f - highLandingLen * 0.5f;
-            float outerNarrowW = narrowCorridorWidth + nwt * 2f;
             float fullHighWallH = nwh + floorThick;
             float highWallMidY = upperFloorY + (nwh - floorThick) * 0.5f;
             Vector3 highFloorPos = LocalToWorld(0f, upperFloorY - floorThick * 0.5f, highLandingMidS);
