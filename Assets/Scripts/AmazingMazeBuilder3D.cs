@@ -136,9 +136,12 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     private object cachedTeleportProvider;
     private CharacterController xrCharacterController;
     private List<Collider> stairFloorColliders = new List<Collider>();
+    private List<Collider> walkableTeleportColliders = new List<Collider>();
     private List<MonoBehaviour> moveProviders = new List<MonoBehaviour>();
     private List<MonoBehaviour> teleportRayInteractors = new List<MonoBehaviour>();
     private MethodInfo tryGetHitInfoMethod;
+    private Vector3 lastBridgeSortPos = new Vector3(9999f, 9999f, 9999f);
+    private int lastBridgeSortLayer = -1;
 
     // Teleport Reticle & State
     private bool wasTeleportRayActiveLastFrame = false;
@@ -491,7 +494,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     /* ============================================================================
      * FRONT-TO-BACK STENCIL PORTAL SORTING & COLLIDER CONTROLLER
      * ============================================================================ */
-    void UpdateBridgeRenderQueuesFrontToBack()
+    void UpdateBridgeRenderQueuesFrontToBack(bool force = false)
     {
         if (bridgeCells.Count == 0 || activePlayerHeadOrBody == null) return;
 
@@ -500,6 +503,12 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         int pc = MazeData.PlayerPos.c;
         int pLayer = MazeData.PlayerPos.layer;
         int playerPlaneBase = AmazingMazeData.BaseLayerOfPlane(pLayer);
+
+        if (!force && pLayer == lastBridgeSortLayer && (camPos - lastBridgeSortPos).sqrMagnitude < 0.0025f)
+            return;
+
+        lastBridgeSortPos = camPos;
+        lastBridgeSortLayer = pLayer;
 
         sortedBridgeList.Clear();
         foreach (var kvp in bridgeCells)
@@ -550,16 +559,16 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
                 if (nsDoorIsCloser)
                 {
-                    br.cellPortalNS.renderQueue = baseQ;
+                    if (br.cellPortalNS.renderQueue != baseQ) br.cellPortalNS.renderQueue = baseQ;
                     ConfigureCellTunnelMaterials(br.cellWallNS, br.cellFloorNS, br.cellCrumbNS, br.cellEdgeNS, 3, baseQ + 1);
-                    br.cellPortalEW.renderQueue = baseQ + 2;
+                    if (br.cellPortalEW.renderQueue != baseQ + 2) br.cellPortalEW.renderQueue = baseQ + 2;
                     ConfigureCellTunnelMaterials(br.cellWallEW, br.cellFloorEW, br.cellCrumbEW, br.cellEdgeEW, 3, baseQ + 3);
                 }
                 else
                 {
-                    br.cellPortalEW.renderQueue = baseQ;
+                    if (br.cellPortalEW.renderQueue != baseQ) br.cellPortalEW.renderQueue = baseQ;
                     ConfigureCellTunnelMaterials(br.cellWallEW, br.cellFloorEW, br.cellCrumbEW, br.cellEdgeEW, 3, baseQ + 1);
-                    br.cellPortalNS.renderQueue = baseQ + 2;
+                    if (br.cellPortalNS.renderQueue != baseQ + 2) br.cellPortalNS.renderQueue = baseQ + 2;
                     ConfigureCellTunnelMaterials(br.cellWallNS, br.cellFloorNS, br.cellCrumbNS, br.cellEdgeNS, 3, baseQ + 3);
                 }
             }
@@ -568,10 +577,19 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     void ConfigureCellTunnelMaterials(Material wallM, Material floorM, Material crumbM, Material edgeM, int stencilComp, int queue)
     {
-        if (wallM != null) { wallM.SetInt("_StencilComp", stencilComp); wallM.renderQueue = queue; }
-        if (floorM != null) { floorM.SetInt("_StencilComp", stencilComp); floorM.renderQueue = queue; }
-        if (crumbM != null) { crumbM.SetInt("_StencilComp", stencilComp); crumbM.renderQueue = queue; }
-        if (edgeM != null) { edgeM.SetInt("_StencilComp", stencilComp); edgeM.renderQueue = queue; }
+        SetStencilAndQueueIfChanged(wallM, stencilComp, queue);
+        SetStencilAndQueueIfChanged(floorM, stencilComp, queue);
+        SetStencilAndQueueIfChanged(crumbM, stencilComp, queue);
+        SetStencilAndQueueIfChanged(edgeM, stencilComp, queue);
+    }
+
+    static void SetStencilAndQueueIfChanged(Material m, int stencilComp, int queue)
+    {
+        if (m == null) return;
+        if (m.GetInt("_StencilComp") != stencilComp)
+            m.SetInt("_StencilComp", stencilComp);
+        if (m.renderQueue != queue)
+            m.renderQueue = queue;
     }
 
     void UpdateNonEuclideanTunnelState()
@@ -634,7 +652,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 if (col != null) col.enabled = !enableNSColliders;
         }
 
-        UpdateBridgeRenderQueuesFrontToBack();
+        UpdateBridgeRenderQueuesFrontToBack(force: true);
     }
 
     /* ============================================================================
@@ -1008,6 +1026,66 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
     }
 
+    static bool IsUnderLeftHandHierarchy(Transform t)
+    {
+        for (Transform cur = t; cur != null; cur = cur.parent)
+        {
+            if (cur.name.IndexOf("left", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+        return false;
+    }
+
+    static void DisableInputActionPropertyOnComponent(object comp, Type compType, string propOrFieldName)
+    {
+        if (comp == null || compType == null) return;
+
+        for (Type t = compType; t != null && t != typeof(MonoBehaviour); t = t.BaseType)
+        {
+            FieldInfo f = t.GetField(propOrFieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (f != null && f.FieldType.Name == "InputActionProperty")
+            {
+                object curVal = f.GetValue(comp);
+                if (curVal != null)
+                {
+                    object actionObj = f.FieldType.GetProperty("action")?.GetValue(curVal);
+                    actionObj?.GetType().GetMethod("Disable")?.Invoke(actionObj, null);
+                    f.SetValue(comp, Activator.CreateInstance(f.FieldType));
+                }
+                return;
+            }
+
+            PropertyInfo p = t.GetProperty(propOrFieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (p != null && p.CanWrite && p.PropertyType.Name == "InputActionProperty")
+            {
+                object curVal = p.GetValue(comp);
+                if (curVal != null)
+                {
+                    object actionObj = p.PropertyType.GetProperty("action")?.GetValue(curVal);
+                    actionObj?.GetType().GetMethod("Disable")?.Invoke(actionObj, null);
+                    p.SetValue(comp, Activator.CreateInstance(p.PropertyType));
+                }
+                return;
+            }
+        }
+    }
+
+    static void DisableInputActionReferenceField(object comp, Type compType, string fieldName)
+    {
+        if (comp == null || compType == null) return;
+        FieldInfo f = compType.GetField(fieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (f != null)
+        {
+            object refVal = f.GetValue(comp);
+            if (refVal != null)
+            {
+                object actionObj = refVal.GetType().GetProperty("action")?.GetValue(refVal);
+                actionObj?.GetType().GetMethod("Disable")?.Invoke(actionObj, null);
+                f.SetValue(comp, null);
+            }
+        }
+    }
+
     void CacheXRLocomotionAndTeleportComponents()
     {
         teleportRayInteractors.Clear();
@@ -1031,6 +1109,49 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             else if (t.GetProperty("moveSpeed", BindingFlags.Public | BindingFlags.Instance) != null)
             {
                 moveProviders.Add(mb);
+                // Strictly split controller responsibilities: Left Controller = Continuous Move, Right Controller = Teleport & Turn
+                DisableInputActionPropertyOnComponent(mb, t, "m_RightHandMoveAction");
+                DisableInputActionPropertyOnComponent(mb, t, "rightHandMoveAction");
+            }
+            else if (t.Name.Contains("SnapTurnProvider") || t.Name.Contains("ContinuousTurnProvider"))
+            {
+                // Disable left-hand turning so the Left thumbstick is 100% dedicated to directional movement
+                DisableInputActionPropertyOnComponent(mb, t, "m_LeftHandSnapTurnAction");
+                DisableInputActionPropertyOnComponent(mb, t, "leftHandSnapTurnAction");
+                DisableInputActionPropertyOnComponent(mb, t, "m_LeftHandTurnAction");
+                DisableInputActionPropertyOnComponent(mb, t, "leftHandTurnAction");
+            }
+            else if (t.Name == "ActionBasedControllerManager")
+            {
+                bool isLeft = IsUnderLeftHandHierarchy(mb.transform);
+                PropertyInfo smoothMotionProp = t.GetProperty("smoothMotionEnabled", BindingFlags.Public | BindingFlags.Instance);
+                FieldInfo smoothMotionField = t.GetField("m_SmoothMotionEnabled", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+
+                if (isLeft)
+                {
+                    // Left Controller: Smooth directional walking only (disable Teleport and Turn on Left hand)
+                    smoothMotionField?.SetValue(mb, true);
+                    smoothMotionProp?.SetValue(mb, true);
+                    DisableInputActionReferenceField(mb, t, "m_TeleportModeActivate");
+                    DisableInputActionReferenceField(mb, t, "m_TeleportModeCancel");
+                    DisableInputActionReferenceField(mb, t, "m_Turn");
+                    DisableInputActionReferenceField(mb, t, "m_SnapTurn");
+
+                    FieldInfo teleField = t.GetField("m_TeleportInteractor", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+                    if (teleField != null)
+                    {
+                        Component leftTele = teleField.GetValue(mb) as Component;
+                        if (leftTele != null) leftTele.gameObject.SetActive(false);
+                        teleField.SetValue(mb, null);
+                    }
+                }
+                else
+                {
+                    // Right Controller: Teleportation + Turn only (disable continuous Move on Right hand)
+                    smoothMotionField?.SetValue(mb, false);
+                    smoothMotionProp?.SetValue(mb, false);
+                    DisableInputActionReferenceField(mb, t, "m_Move");
+                }
             }
             else if (t.Name == "XRRayInteractor")
             {
@@ -1039,6 +1160,13 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 string goName = mb.gameObject.name.ToLowerInvariant();
                 if (goName.Contains("teleport"))
                 {
+                    if (IsUnderLeftHandHierarchy(mb.transform))
+                    {
+                        mb.enabled = false;
+                        mb.gameObject.SetActive(false);
+                        continue;
+                    }
+
                     teleportRayInteractors.Add(mb);
                     if (tryGetHitInfoMethod == null)
                     {
@@ -1059,10 +1187,21 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     void ConfigureFloorTeleportationArea(GameObject floor)
     {
-        if (teleportAreaType == null) return;
+        if (floor == null) return;
+        Collider col = floor.GetComponent<Collider>();
+        if (col != null)
+            walkableTeleportColliders.Add(col);
+    }
 
-        floor.SetActive(false);
-        Component teleArea = floor.AddComponent(teleportAreaType);
+    void RegisterSingleCombinedTeleportationArea()
+    {
+        if (teleportAreaType == null || mazeRoot == null || walkableTeleportColliders.Count == 0) return;
+
+        GameObject teleHost = new GameObject("MazeWalkableTeleportArea");
+        teleHost.transform.SetParent(mazeRoot.transform, false);
+        teleHost.SetActive(false);
+
+        Component teleArea = teleHost.AddComponent(teleportAreaType);
 
         var collidersProp = teleportAreaType.GetProperty("colliders");
         if (collidersProp != null)
@@ -1071,7 +1210,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             if (colList != null)
             {
                 colList.Clear();
-                colList.Add(floor.GetComponent<Collider>());
+                for (int i = 0; i < walkableTeleportColliders.Count; i++)
+                {
+                    if (walkableTeleportColliders[i] != null)
+                        colList.Add(walkableTeleportColliders[i]);
+                }
             }
         }
 
@@ -1082,7 +1225,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
 
         SetAllInteractionLayersOnComponent(teleArea);
-        floor.SetActive(true);
+        teleHost.SetActive(true);
     }
 
     /* ============================================================================
@@ -1412,7 +1555,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         breadcrumbMeshes.Clear();
         rampBreadcrumbMeshes.Clear();
         stairFloorColliders.Clear();
+        walkableTeleportColliders.Clear();
         bridgeCells.Clear();
+        lastBridgeSortLayer = -1;
 
         InitFramebuffer(
             MARGIN_X * 2 + MazeData.MaxCol * TILE_STRIDE,
@@ -1480,6 +1625,130 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         float endY   = GetLayerBaseFloorY(MazeData.EndPos.layer) + markerOffsetY;
         startMarkerRenderer = SpawnMarkerPrimitive(PrimitiveType.Sphere, MazeData.StartPos.r, MazeData.StartPos.c, startY, "StartSphere_Marker");
         endMarkerRenderer   = SpawnMarkerPrimitive(PrimitiveType.Cube, MazeData.EndPos.r, MazeData.EndPos.c, endY, "GoalCube_Marker");
+
+        CombineStaticMazeMeshes();
+        RegisterSingleCombinedTeleportationArea();
+    }
+
+    void CombineStaticMazeMeshes()
+    {
+        if (mazeRoot == null) return;
+
+        // Collect all dynamic breadcrumb GameObjects so they are excluded from static mesh combining
+        HashSet<GameObject> excludedObjects = new HashSet<GameObject>();
+        foreach (var kvp in breadcrumbMeshes)
+        {
+            GameObject[] arr = kvp.Value;
+            if (arr == null) continue;
+            for (int i = 0; i < arr.Length; i++)
+            {
+                if (arr[i] == null) continue;
+                excludedObjects.Add(arr[i]);
+                foreach (Transform child in arr[i].GetComponentsInChildren<Transform>(true))
+                    excludedObjects.Add(child.gameObject);
+            }
+        }
+        foreach (var kvp in rampBreadcrumbMeshes)
+        {
+            List<GameObject> list = kvp.Value;
+            if (list == null) continue;
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i] != null) excludedObjects.Add(list[i]);
+            }
+        }
+        if (startMarkerRenderer != null) excludedObjects.Add(startMarkerRenderer.gameObject);
+        if (endMarkerRenderer != null) excludedObjects.Add(endMarkerRenderer.gameObject);
+
+        Dictionary<Material, List<CombineInstance>> combineGroups = new Dictionary<Material, List<CombineInstance>>();
+        if (whiteWallMaterial != null) combineGroups[whiteWallMaterial] = new List<CombineInstance>(4096);
+        if (whiteFloorMaterial != null) combineGroups[whiteFloorMaterial] = new List<CombineInstance>(1024);
+        if (blackEdgeMaterial != null) combineGroups[blackEdgeMaterial] = new List<CombineInstance>(8192);
+        if (checkerboardMaterial != null) combineGroups[checkerboardMaterial] = new List<CombineInstance>(512);
+
+        List<GameObject> visualOnlyToDestroy = new List<GameObject>(12000);
+        List<Mesh> instantiatedMeshesToDestroy = new List<Mesh>(12000);
+
+        MeshRenderer[] allRenderers = mazeRoot.GetComponentsInChildren<MeshRenderer>(true);
+        for (int i = 0; i < allRenderers.Length; i++)
+        {
+            MeshRenderer mr = allRenderers[i];
+            if (mr == null) continue;
+            GameObject go = mr.gameObject;
+            if (excludedObjects.Contains(go)) continue;
+
+            Material sharedMat = mr.sharedMaterial;
+            if (sharedMat == null || !combineGroups.TryGetValue(sharedMat, out List<CombineInstance> groupList))
+                continue;
+
+            MeshFilter mf = go.GetComponent<MeshFilter>();
+            if (mf == null || mf.sharedMesh == null) continue;
+
+            Mesh srcMesh = mf.sharedMesh;
+            groupList.Add(new CombineInstance
+            {
+                mesh = srcMesh,
+                transform = go.transform.localToWorldMatrix,
+                subMeshIndex = 0
+            });
+
+            // If this mesh was cloned at runtime (or generated procedurally), schedule it for cleanup after CombineMeshes
+            if (srcMesh.name.EndsWith("(Clone)", StringComparison.Ordinal) || srcMesh.name.EndsWith("_Mesh", StringComparison.Ordinal))
+            {
+                instantiatedMeshesToDestroy.Add(srcMesh);
+            }
+
+            if (go.GetComponent<Collider>() == null && go.transform.childCount == 0)
+            {
+                visualOnlyToDestroy.Add(go);
+            }
+            else
+            {
+                Destroy(mr);
+                Destroy(mf);
+            }
+        }
+
+        foreach (var kvp in combineGroups)
+        {
+            Material mat = kvp.Key;
+            List<CombineInstance> instances = kvp.Value;
+            if (instances.Count == 0) continue;
+
+            GameObject combinedObj = new GameObject($"CombinedMaze_{mat.name}");
+            combinedObj.transform.SetParent(mazeRoot.transform, false);
+            combinedObj.transform.position = Vector3.zero;
+            combinedObj.transform.rotation = Quaternion.identity;
+            combinedObj.transform.localScale = Vector3.one;
+
+            Mesh combinedMesh = new Mesh
+            {
+                name = $"CombinedMesh_{mat.name}",
+                indexFormat = UnityEngine.Rendering.IndexFormat.UInt32
+            };
+            combinedMesh.CombineMeshes(instances.ToArray(), true, true, false);
+            combinedMesh.RecalculateBounds();
+
+            MeshFilter cmf = combinedObj.AddComponent<MeshFilter>();
+            cmf.sharedMesh = combinedMesh;
+
+            MeshRenderer cmr = combinedObj.AddComponent<MeshRenderer>();
+            cmr.sharedMaterial = mat;
+            cmr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            cmr.receiveShadows = false;
+        }
+
+        for (int i = 0; i < visualOnlyToDestroy.Count; i++)
+        {
+            if (visualOnlyToDestroy[i] != null)
+                Destroy(visualOnlyToDestroy[i]);
+        }
+
+        for (int i = 0; i < instantiatedMeshesToDestroy.Count; i++)
+        {
+            if (instantiatedMeshesToDestroy[i] != null)
+                Destroy(instantiatedMeshesToDestroy[i]);
+        }
     }
 
     void BuildSimultaneousNonEuclideanBridgeCell(int r, int c, int baseOpenMask, int bridgeOpenMask, bool isNarrowPlane)
@@ -3069,6 +3338,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     void SetupVRRigAndWristMap()
     {
         ForceEnableAllXRInputActions(xrRigRoot.gameObject);
+        CacheXRLocomotionAndTeleportComponents();
 
         float startY = GetLayerBaseFloorY(MazeData.StartPos.layer);
         xrRigRoot.position = CellToWorldCenter(MazeData.StartPos.r, MazeData.StartPos.c, startY + 0.02f);
