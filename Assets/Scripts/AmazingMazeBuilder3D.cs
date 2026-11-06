@@ -181,7 +181,6 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     private List<AmazingMazeData.NodePos> activeSolutionNodes = new List<AmazingMazeData.NodePos>();
 
     private AudioSource windAudioSource;
-    private AudioLowPassFilter windLowPassFilter;
     private AudioSource tunnelRoomAudioSource;
     private AudioSource upperSkyAudioSource;
     private AudioSource fanfareAudioSource;
@@ -418,6 +417,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         else
             SpawnSimpleDesktopPlayer();
 
+        RequestAndroidAudioFocus();
         // Initialize procedural audio AFTER the player camera / AudioListener is active
         EnsureProceduralAudioAndWind();
 
@@ -462,8 +462,94 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
     }
 
+    private float nextAndroidAudioFocusRetryTime = 0f;
+
+    void RequestAndroidAudioFocus()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        try
+        {
+            using (AndroidJavaClass unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer"))
+            using (AndroidJavaObject activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity"))
+            {
+                if (activity == null) return;
+                using (AndroidJavaObject audioManager = activity.Call<AndroidJavaObject>("getSystemService", "audio"))
+                {
+                    if (audioManager == null) return;
+
+                    int sdkInt = 0;
+                    using (AndroidJavaClass versionClass = new AndroidJavaClass("android.os.Build$VERSION"))
+                    {
+                        sdkInt = versionClass.GetStatic<int>("SDK_INT");
+                    }
+
+                    if (sdkInt >= 26)
+                    {
+                        using (AndroidJavaObject attrBuilder = new AndroidJavaObject("android.media.AudioAttributes$Builder"))
+                        {
+                            attrBuilder.Call<AndroidJavaObject>("setUsage", 1); // USAGE_MEDIA = 1
+                            attrBuilder.Call<AndroidJavaObject>("setContentType", 2); // CONTENT_TYPE_MUSIC = 2
+                            using (AndroidJavaObject attributes = attrBuilder.Call<AndroidJavaObject>("build"))
+                            using (AndroidJavaObject reqBuilder = new AndroidJavaObject("android.media.AudioFocusRequest$Builder", 1)) // AUDIOFOCUS_GAIN = 1
+                            {
+                                reqBuilder.Call<AndroidJavaObject>("setAudioAttributes", attributes);
+                                reqBuilder.Call<AndroidJavaObject>("setAcceptsDelayedFocusGain", true);
+                                reqBuilder.Call<AndroidJavaObject>("setWillPauseWhenDucked", false);
+                                using (AndroidJavaObject focusReq = reqBuilder.Call<AndroidJavaObject>("build"))
+                                {
+                                    audioManager.Call<int>("requestAudioFocus", focusReq);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        audioManager.Call<int>("requestAudioFocus", null, 3, 1);
+                    }
+                }
+            }
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning("[AmazingMaze] RequestAndroidAudioFocus: " + ex.Message);
+        }
+#endif
+    }
+
+    void OnApplicationPause(bool paused)
+    {
+        if (!paused)
+        {
+            RequestAndroidAudioFocus();
+            AudioListener.pause = false;
+            AudioListener.volume = 1.0f;
+            EnsureProceduralAudioAndWind();
+        }
+    }
+
+    void OnApplicationFocus(bool hasFocus)
+    {
+        if (hasFocus)
+        {
+            RequestAndroidAudioFocus();
+            AudioListener.pause = false;
+            AudioListener.volume = 1.0f;
+            EnsureProceduralAudioAndWind();
+        }
+    }
+
     void Update()
     {
+        // Unconditionally keep AudioListener unpaused and full volume across Android Quest focus transitions
+        if (AudioListener.pause) AudioListener.pause = false;
+        if (AudioListener.volume < 1.0f) AudioListener.volume = 1.0f;
+
+        if (Time.time < 5f || Time.time >= nextAndroidAudioFocusRetryTime)
+        {
+            nextAndroidAudioFocusRetryTime = Time.time + 3.0f;
+            RequestAndroidAudioFocus();
+        }
+
 #if ENABLE_LEGACY_INPUT_MANAGER
         if (Input.GetKeyDown(KeyCode.Tab))
         {
@@ -3869,19 +3955,49 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         AudioListener.pause = false;
         AudioListener.volume = 1.0f;
 
-        Transform audioParent = activePlayerHeadOrBody != null ? activePlayerHeadOrBody : (Camera.main != null ? Camera.main.transform : transform);
-        AudioListener existingListener = FindObjectOfType<AudioListener>();
-        if (existingListener == null && audioParent != null)
+        Transform activeCamTransform = activePlayerHeadOrBody != null ? activePlayerHeadOrBody : (Camera.main != null ? Camera.main.transform : transform);
+
+        // Find ALL AudioListeners in scene (including inactive) to prevent duplicate listener failure on Android Quest
+        AudioListener[] allListeners = FindObjectsOfType<AudioListener>(true);
+        AudioListener primaryListener = null;
+
+        if (activeCamTransform != null)
         {
-            existingListener = audioParent.gameObject.AddComponent<AudioListener>();
-        }
-        if (existingListener != null)
-        {
-            existingListener.enabled = true;
-            audioParent = existingListener.transform;
+            primaryListener = activeCamTransform.GetComponent<AudioListener>();
         }
 
-        int sr = AudioSettings.outputSampleRate > 8000 ? AudioSettings.outputSampleRate : 48000;
+        if (primaryListener == null && allListeners != null && allListeners.Length > 0)
+        {
+            primaryListener = allListeners[0];
+        }
+
+        if (primaryListener == null && activeCamTransform != null)
+        {
+            primaryListener = activeCamTransform.gameObject.AddComponent<AudioListener>();
+        }
+
+        if (primaryListener != null)
+        {
+            primaryListener.enabled = true;
+            if (!primaryListener.gameObject.activeSelf)
+                primaryListener.gameObject.SetActive(true);
+
+            if (allListeners != null)
+            {
+                for (int i = 0; i < allListeners.Length; i++)
+                {
+                    if (allListeners[i] != null && allListeners[i] != primaryListener)
+                    {
+                        Destroy(allListeners[i]);
+                    }
+                }
+            }
+        }
+
+        Transform audioParent = (primaryListener != null) ? primaryListener.transform : activeCamTransform;
+
+        AudioConfiguration config = AudioSettings.GetConfiguration();
+        int sr = (config.sampleRate > 8000) ? config.sampleRate : (AudioSettings.outputSampleRate > 8000 ? AudioSettings.outputSampleRate : 48000);
 
         if (windLoopClip == null)
             windLoopClip = CreateProceduralPineForestWindLoopClip(16.0f, sr);
@@ -3905,14 +4021,13 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             windAudioSource.clip = windLoopClip;
             windAudioSource.loop = true;
             windAudioSource.spatialBlend = 0f;
+            windAudioSource.bypassEffects = true;
+            windAudioSource.bypassListenerEffects = true;
+            windAudioSource.bypassReverbZones = true;
             windAudioSource.priority = 0;
             windAudioSource.volume = 0.32f;
             windAudioSource.playOnAwake = true;
             windAudioSource.ignoreListenerPause = true;
-
-            windLowPassFilter = windObj.AddComponent<AudioLowPassFilter>();
-            windLowPassFilter.cutoffFrequency = 2600f;
-            windLowPassFilter.lowpassResonanceQ = 1.0f;
 
             windAudioSource.Play();
         }
@@ -3926,6 +4041,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             tunnelRoomAudioSource.clip = tunnelRoomLoopClip;
             tunnelRoomAudioSource.loop = true;
             tunnelRoomAudioSource.spatialBlend = 0f;
+            tunnelRoomAudioSource.bypassEffects = true;
+            tunnelRoomAudioSource.bypassListenerEffects = true;
+            tunnelRoomAudioSource.bypassReverbZones = true;
             tunnelRoomAudioSource.priority = 1;
             tunnelRoomAudioSource.volume = 0f;
             tunnelRoomAudioSource.playOnAwake = true;
@@ -3942,6 +4060,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             upperSkyAudioSource.clip = upperSkyLoopClip;
             upperSkyAudioSource.loop = true;
             upperSkyAudioSource.spatialBlend = 0f;
+            upperSkyAudioSource.bypassEffects = true;
+            upperSkyAudioSource.bypassListenerEffects = true;
+            upperSkyAudioSource.bypassReverbZones = true;
             upperSkyAudioSource.priority = 2;
             upperSkyAudioSource.volume = 0f;
             upperSkyAudioSource.playOnAwake = true;
@@ -3958,6 +4079,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             fanfareAudioSource.clip = victoryFanfareClip;
             fanfareAudioSource.loop = false;
             fanfareAudioSource.spatialBlend = 0f;
+            fanfareAudioSource.bypassEffects = true;
+            fanfareAudioSource.bypassListenerEffects = true;
+            fanfareAudioSource.bypassReverbZones = true;
             fanfareAudioSource.priority = 0;
             fanfareAudioSource.volume = 0.95f;
             fanfareAudioSource.playOnAwake = false;
@@ -3972,6 +4096,9 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             sfxAudioSource = sfxObj.AddComponent<AudioSource>();
             sfxAudioSource.loop = false;
             sfxAudioSource.spatialBlend = 0f;
+            sfxAudioSource.bypassEffects = true;
+            sfxAudioSource.bypassListenerEffects = true;
+            sfxAudioSource.bypassReverbZones = true;
             sfxAudioSource.priority = 10;
             sfxAudioSource.volume = 0.90f;
             sfxAudioSource.playOnAwake = false;
@@ -4129,25 +4256,16 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         float smoothTunnel = Mathf.SmoothStep(0f, 1f, currentTunnelAudioBlend);
         float smoothUpper  = Mathf.SmoothStep(0f, 1f, currentUpperAudioBlend);
 
-        // 4. Modulate Main Pine Forest Breeze + Logarithmic (Octave-Even) Low-Pass Occlusion Filter
+        // 4. Modulate Main Pine Forest Breeze (open sky fullness -> gentle muffled shelter inside arch tunnel)
         if (windAudioSource != null)
         {
-            // Keep a generous overlap floor (0.20 inside tunnel) so the outdoor breeze never drops out abruptly
+            // Keep a generous overlap floor (0.16 inside tunnel) so the outdoor breeze never drops out abruptly
             float openVol = Mathf.Lerp(0.32f, 0.39f, smoothUpper);
-            windAudioSource.volume = Mathf.Lerp(openVol, 0.20f, smoothTunnel);
+            windAudioSource.volume = Mathf.Lerp(openVol, 0.16f, smoothTunnel);
 
             // Subtle, natural pitch shift without abrupt tape-speed warping
             float openPitch = Mathf.Lerp(0.96f, 1.04f, smoothUpper);
-            windAudioSource.pitch = Mathf.Lerp(openPitch, 0.90f, smoothTunnel);
-        }
-
-        if (windLowPassFilter != null)
-        {
-            // Logarithmic (octave-linear) cutoff interpolation: 2600 Hz lower -> 6800 Hz upper -> 420 Hz inside arch
-            float openCutoff = Mathf.Exp(Mathf.Lerp(Mathf.Log(2600f), Mathf.Log(6800f), smoothUpper));
-            float targetCutoff = Mathf.Exp(Mathf.Lerp(Mathf.Log(openCutoff), Mathf.Log(420f), smoothTunnel));
-            windLowPassFilter.cutoffFrequency = targetCutoff;
-            windLowPassFilter.lowpassResonanceQ = Mathf.Lerp(1.0f, 1.18f, smoothTunnel);
+            windAudioSource.pitch = Mathf.Lerp(openPitch, 0.88f, smoothTunnel);
         }
 
         // 5. Overlapping Crossfade for Enclosed Arch Room Acoustics (lingers gently on exit)

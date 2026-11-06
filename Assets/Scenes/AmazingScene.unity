@@ -162,7 +162,7 @@ MonoBehaviour:
   runSpeed: 7.2
   maxTeleportCellsPerJump: 6
   architectureStyle: 0
-  skillLevel: 2
+  skillLevel: 0
   cellSize: 3
   wallHeight: 0.85
   tunnelArchHeight: 2.4
