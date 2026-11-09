@@ -550,6 +550,14 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             RequestAndroidAudioFocus();
         }
 
+        // While a new maze is being generated/built across frames, gameplay logic is paused.
+        // Head tracking keeps running (XR rendering never stalls) and the floating progress window follows the head.
+        if (isGeneratingMaze)
+        {
+            UpdateMazeBuildProgressPanelPose(false);
+            return;
+        }
+
 #if ENABLE_LEGACY_INPUT_MANAGER
         if (Input.GetKeyDown(KeyCode.Tab))
         {
@@ -711,19 +719,484 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     public void SwitchToSkillLevel(int newSkillLevel)
     {
+        if (isGeneratingMaze) return;
         skillLevel = Mathf.Clamp(newSkillLevel, 0, 3);
         pendingSkillLevel = skillLevel;
         lastBuiltSkillLevel = skillLevel;
         ResetMazeTimerAndSolution();
         PlayClickBlipSound();
-        MazeData.MakeMaze(skillLevel);
-        RebuildMazeGeometryOnly();
+        mazeGenerationCoroutine = StartCoroutine(GenerateNewMazeAsyncRoutine(skillLevel));
+    }
+
+    /* ============================================================================
+     * ASYNCHRONOUS (FRAME-SLICED) MAZE GENERATION WITH LIVE PROGRESS WINDOW
+     * ----------------------------------------------------------------------------
+     * 1. Maze topology is generated on a worker thread (pure C# data, no Unity API).
+     * 2. 3D geometry is built under a hidden root, yielding whenever the per-frame
+     *    time budget is exceeded so XR head tracking stays at full frame rate.
+     * 3. A floating Macintosh window follows the head, drawing the new maze map
+     *    cell-by-cell as it is constructed, with a progress bar in the title bar.
+     * 4. When finished, the old maze sinks into the ground and the new one rises.
+     * ============================================================================ */
+    public bool IsGeneratingMaze => isGeneratingMaze;
+    private bool isGeneratingMaze = false;
+    private Coroutine mazeGenerationCoroutine;
+    private float mazeBuildProgress01 = 0f;
+    private string mazeBuildStatusText = "";
+    private int mazeBuildTotalUnits = 1;
+    private int mazeBuildDoneUnits = 0;
+    private bool mazeBuildRevealCellsOnMap = false;
+    private GameObject pendingOldMazeRoot;
+    private readonly System.Diagnostics.Stopwatch buildFrameStopwatch = new System.Diagnostics.Stopwatch();
+    private double buildFrameBudgetMs = double.MaxValue;
+    private int buildDestroyBatchSize = int.MaxValue;
+    private float lastProgressPanelFlushTime = -1f;
+
+    private GameObject buildProgressPanel;
+    private Material buildProgressPanelMaterial;
+    private Vector3 buildPanelSmoothedPos;
+    private Quaternion buildPanelSmoothedRot = Quaternion.identity;
+
+    [Header("Asynchronous Maze Generation")]
+    [Tooltip("Max milliseconds of maze-building work per frame (Quest 72Hz frame = 13.9ms).")]
+    public float mazeBuildFrameBudgetMs = 6.0f;
+    [Tooltip("Distance in meters of the floating progress window in front of the head.")]
+    public float buildPanelDistance = 1.15f;
+    [Tooltip("Width in meters of the floating progress window.")]
+    public float buildPanelWidth = 0.80f;
+
+    bool BuildBudgetExceeded()
+    {
+        return buildFrameStopwatch.Elapsed.TotalMilliseconds >= buildFrameBudgetMs;
+    }
+
+    void AdvanceBuildProgress(int units, string status = null)
+    {
+        mazeBuildDoneUnits += units;
+        if (status != null) mazeBuildStatusText = status;
+        mazeBuildProgress01 = Mathf.Clamp01(mazeBuildDoneUnits / (float)Mathf.Max(1, mazeBuildTotalUnits));
+    }
+
+    /// <summary>Called at every yield point inside the build routines: refreshes the floating progress window.</summary>
+    void OnBuildYield()
+    {
+        if (!isGeneratingMaze) return;
+        // Throttle texture uploads (~20Hz) to keep GPU upload cost tiny on Quest
+        if (Time.unscaledTime - lastProgressPanelFlushTime >= 0.05f)
+        {
+            lastProgressPanelFlushTime = Time.unscaledTime;
+            DrawBuildProgressTopBar2D();
+            FlushFramebufferWithPlayerWedge();
+        }
+    }
+
+    /// <summary>Drains an IEnumerator synchronously (used at startup and for the desktop Tab style toggle).</summary>
+    static void RunEnumeratorToCompletion(IEnumerator routine)
+    {
+        Stack<IEnumerator> stack = new Stack<IEnumerator>();
+        stack.Push(routine);
+        while (stack.Count > 0)
+        {
+            IEnumerator top = stack.Peek();
+            if (top.MoveNext())
+            {
+                if (top.Current is IEnumerator nested) stack.Push(nested);
+            }
+            else
+            {
+                stack.Pop();
+            }
+        }
+    }
+
+    IEnumerator GenerateNewMazeAsyncRoutine(int level)
+    {
+        isGeneratingMaze = true;
+        mazeBuildProgress01 = 0f;
+        mazeBuildDoneUnits = 0;
+        mazeBuildTotalUnits = 1;
+        mazeBuildStatusText = "Generating maze...";
+        mazeBuildRevealCellsOnMap = true;
+        lastProgressPanelFlushTime = -1f;
+
+        DisableTeleportAndLocomotionDuringBuild(true);
+        ShowBuildProgressPanel();
+        DrawBuildProgressTopBar2D();
+        FlushFramebufferWithPlayerWedge();
+        yield return null;
+
+        // ---- 1. Maze topology on a worker thread ----
+        AmazingMazeData newData = new AmazingMazeData();
+        System.Exception genError = null;
+        var genTask = System.Threading.Tasks.Task.Run(() =>
+        {
+            try { newData.MakeMaze(level); }
+            catch (System.Exception ex) { genError = ex; }
+        });
+        float genStart = Time.unscaledTime;
+        while (!genTask.IsCompleted)
+        {
+            // Animate an indeterminate sweep during topology generation
+            mazeBuildProgress01 = Mathf.Repeat((Time.unscaledTime - genStart) * 0.6f, 1f) * 0.05f;
+            OnBuildYield();
+            yield return null;
+        }
+        if (genError != null)
+        {
+            Debug.LogError("[AmazingMaze] Maze generation failed: " + genError);
+            newData = new AmazingMazeData();
+            newData.MakeMaze(level);
+        }
+        MazeData = newData;
+
+        // ---- 2. Frame-sliced 3D geometry build under a hidden root ----
+        buildFrameBudgetMs = Mathf.Max(1.5f, mazeBuildFrameBudgetMs);
+        buildDestroyBatchSize = 600;
+        buildFrameStopwatch.Restart();
+        yield return BuildMazeGeometryRoutine(asyncHiddenBuild: true);
+
+        // Restore synchronous defaults for any later sync rebuilds
+        buildFrameBudgetMs = double.MaxValue;
+        buildDestroyBatchSize = int.MaxValue;
+        buildFrameStopwatch.Stop();
+
+        mazeBuildStatusText = "Ready!";
+        mazeBuildProgress01 = 1f;
+        lastProgressPanelFlushTime = -1f;
+        OnBuildYield();
+        yield return null;
+
+        // ---- 3. Swap: old maze sinks, player moves to start, new maze rises ----
+        GameObject oldRoot = pendingOldMazeRoot;
+        pendingOldMazeRoot = null;
+        if (oldRoot != null)
+            yield return AnimateMazeRootVerticalScale(oldRoot, 1f, 0.02f, 0.45f);
+        if (oldRoot != null) Destroy(oldRoot);
+
+        HideBuildProgressPanel();
+
         if (xrRigRoot != null && leftWristTransform != null)
             Build3DWristMapTablet(leftWristTransform);
-        IgnoreStairFloorCollisionsForPlayer();
         RepositionPlayerAtStart();
+
+        mazeRoot.transform.localScale = new Vector3(1f, 0.02f, 1f);
+        mazeRoot.SetActive(true);
+        IgnoreStairFloorCollisionsForPlayer();
         UpdateNonEuclideanTunnelState();
+        mazeBuildRevealCellsOnMap = false;
+        isGeneratingMaze = false;   // Map/wedge rendering resumes normally from here
         UpdateBreadcrumbsAnd2DMap();
+        isGeneratingMaze = true;    // Keep gameplay paused during the rise animation
+
+        yield return AnimateMazeRootVerticalScale(mazeRoot, 0.02f, 1f, 0.85f);
+        mazeRoot.transform.localScale = Vector3.one;
+        Physics.SyncTransforms();
+
+        ResetMazeTimerAndSolution();
+        DisableTeleportAndLocomotionDuringBuild(false);
+        isGeneratingMaze = false;
+        mazeGenerationCoroutine = null;
+        UpdateBreadcrumbsAnd2DMap();
+    }
+
+    IEnumerator AnimateMazeRootVerticalScale(GameObject root, float fromY, float toY, float duration)
+    {
+        if (root == null) yield break;
+        float t = 0f;
+        while (t < duration && root != null)
+        {
+            t += Time.deltaTime;
+            float k = Mathf.Clamp01(t / duration);
+            float eased = k * k * (3f - 2f * k);
+            root.transform.localScale = new Vector3(1f, Mathf.Lerp(fromY, toY, eased), 1f);
+            yield return null;
+        }
+        if (root != null) root.transform.localScale = new Vector3(1f, toY, 1f);
+    }
+
+    readonly List<Behaviour> buildDisabledLocomotion = new List<Behaviour>();
+
+    void DisableTeleportAndLocomotionDuringBuild(bool disable)
+    {
+        if (disable)
+        {
+            buildDisabledLocomotion.Clear();
+            if (xrRigRoot == null) return;
+            foreach (MonoBehaviour mb in xrRigRoot.GetComponentsInChildren<MonoBehaviour>(true))
+            {
+                if (mb == null || !mb.enabled) continue;
+                string n = mb.GetType().Name;
+                // Movement providers only; head tracking (TrackedPoseDriver) and controllers stay live
+                if (n.Contains("MoveProvider") || n.Contains("TeleportationProvider") || n.Contains("TurnProvider"))
+                {
+                    mb.enabled = false;
+                    buildDisabledLocomotion.Add(mb);
+                }
+            }
+        }
+        else
+        {
+            for (int i = 0; i < buildDisabledLocomotion.Count; i++)
+                if (buildDisabledLocomotion[i] != null) buildDisabledLocomotion[i].enabled = true;
+            buildDisabledLocomotion.Clear();
+        }
+    }
+
+    void ShowBuildProgressPanel()
+    {
+        if (activePlayerHeadOrBody == null) return;
+        if (buildProgressPanel == null)
+        {
+            buildProgressPanel = new GameObject("Mac1984_BuildProgressWindow");
+
+            GameObject bezel = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            bezel.name = "Bezel";
+            Destroy(bezel.GetComponent<Collider>());
+            bezel.transform.SetParent(buildProgressPanel.transform, false);
+            bezel.GetComponent<Renderer>().sharedMaterial = blackEdgeMaterial;
+
+            GameObject screen = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            screen.name = "Screen";
+            Destroy(screen.GetComponent<Collider>());
+            screen.transform.SetParent(buildProgressPanel.transform, false);
+            buildProgressPanelMaterial = new Material(FindPureUnlitTextureShader());
+            ConfigurePureUnlitMaterial(buildProgressPanelMaterial);
+            screen.GetComponent<Renderer>().sharedMaterial = buildProgressPanelMaterial;
+        }
+
+        LayoutBuildProgressPanel();
+        buildProgressPanel.SetActive(true);
+        UpdateMazeBuildProgressPanelPose(true);
+    }
+
+    void LayoutBuildProgressPanel()
+    {
+        if (buildProgressPanel == null) return;
+        float aspect = (fbWidth > 0) ? (float)fbHeight / fbWidth : 0.75f;
+        float w = buildPanelWidth;
+        float h = w * aspect;
+        Transform bezel = buildProgressPanel.transform.Find("Bezel");
+        Transform screen = buildProgressPanel.transform.Find("Screen");
+        if (bezel != null)
+        {
+            bezel.localPosition = new Vector3(0f, 0f, 0.006f);
+            bezel.localScale = new Vector3(w + 0.02f, h + 0.02f, 0.01f);
+        }
+        if (screen != null)
+        {
+            screen.localPosition = Vector3.zero;
+            screen.localScale = new Vector3(w, h, 1f);
+        }
+        if (buildProgressPanelMaterial != null) buildProgressPanelMaterial.mainTexture = mac2DMapTex;
+    }
+
+    void HideBuildProgressPanel()
+    {
+        if (buildProgressPanel != null) buildProgressPanel.SetActive(false);
+    }
+
+    /// <summary>Lazy-follow placement: the window drifts to stay in front of the head (comfortable in VR).</summary>
+    void UpdateMazeBuildProgressPanelPose(bool snap)
+    {
+        if (buildProgressPanel == null || !buildProgressPanel.activeSelf || activePlayerHeadOrBody == null) return;
+        Transform head = activePlayerHeadOrBody;
+        Vector3 flatFwd = Vector3.ProjectOnPlane(head.forward, Vector3.up);
+        if (flatFwd.sqrMagnitude < 1e-4f) flatFwd = Vector3.ProjectOnPlane(head.up, Vector3.up);
+        flatFwd.Normalize();
+
+        Vector3 targetPos = head.position + flatFwd * buildPanelDistance + Vector3.down * 0.08f;
+        Quaternion targetRot = Quaternion.LookRotation(flatFwd, Vector3.up);
+
+        if (snap)
+        {
+            buildPanelSmoothedPos = targetPos;
+            buildPanelSmoothedRot = targetRot;
+        }
+        else
+        {
+            float k = 1f - Mathf.Exp(-Time.deltaTime * 4.0f);
+            buildPanelSmoothedPos = Vector3.Lerp(buildPanelSmoothedPos, targetPos, k);
+            buildPanelSmoothedRot = Quaternion.Slerp(buildPanelSmoothedRot, targetRot, k);
+        }
+        buildProgressPanel.transform.SetPositionAndRotation(buildPanelSmoothedPos, buildPanelSmoothedRot);
+    }
+
+    /// <summary>Draws "Building maze..." plus a classic Mac striped progress bar into the 36px title bar.</summary>
+    void DrawBuildProgressTopBar2D()
+    {
+        if (fbPixels == null) return;
+        FillRectFB(0, 0, fbWidth, TOP_BAR_HEIGHT, 0);
+        FillRectFB(0, 0, fbWidth, 2, 1);
+        FillRectFB(0, TOP_BAR_HEIGHT - 2, fbWidth, 2, 1);
+        FillRectFB(0, 0, 2, TOP_BAR_HEIGHT, 1);
+        FillRectFB(fbWidth - 2, 0, 2, TOP_BAR_HEIGHT, 1);
+
+        string label = string.IsNullOrEmpty(mazeBuildStatusText) ? "Building maze..." : mazeBuildStatusText;
+        int textY = (TOP_BAR_HEIGHT - 14) / 2;
+        DrawChicagoTextFB(12, textY, label, 1);
+
+        int labelW = MeasureChicagoText("Building walls...") + 24;
+        int barX = Mathf.Max(labelW, 150);
+        int barW = fbWidth - barX - 14;
+        int barH = 14;
+        int barY = (TOP_BAR_HEIGHT - barH) / 2;
+        if (barW < 20) return;
+
+        // 1px black frame, white interior, filled with black up to progress
+        FillRectFB(barX, barY, barW, 1, 1);
+        FillRectFB(barX, barY + barH - 1, barW, 1, 1);
+        FillRectFB(barX, barY, 1, barH, 1);
+        FillRectFB(barX + barW - 1, barY, 1, barH, 1);
+        int innerW = barW - 4;
+        int filled = Mathf.RoundToInt(innerW * mazeBuildProgress01);
+        FillRectFB(barX + 2, barY + 2, filled, barH - 4, 1);
+    }
+
+    IEnumerator BuildMazeGeometryRoutine(bool asyncHiddenBuild)
+    {
+        // Ensure upper narrow walkway (including its 0.12m floor slab thickness) always sits cleanly above lower archway roofs and edge bars
+        upperFloorY = Mathf.Max(upperFloorY, tunnelArchHeight + 0.25f);
+        lastBuiltStyle = architectureStyle;
+
+        GameObject previousRoot = mazeRoot;
+        mazeRoot = new GameObject("MazeGeometryRoot");
+        if (asyncHiddenBuild)
+        {
+            // Build invisibly; old maze stays visible until the swap
+            mazeRoot.SetActive(false);
+            if (pendingOldMazeRoot != null && pendingOldMazeRoot != previousRoot) Destroy(pendingOldMazeRoot);
+            pendingOldMazeRoot = previousRoot;
+        }
+        else if (previousRoot != null)
+        {
+            Destroy(previousRoot);
+        }
+
+        breadcrumbMeshes.Clear();
+        rampBreadcrumbMeshes.Clear();
+        stairFloorColliders.Clear();
+        walkableTeleportColliders.Clear();
+        bridgeCells.Clear();
+        lastBridgeSortLayer = -1;
+
+        int rawMazeW = MazeData.MaxCol * TILE_STRIDE + 1;
+        int rawMazeH = MazeData.MaxRow * TILE_STRIDE + 1;
+        int canvasW = Mathf.Max(481, rawMazeW + MARGIN_X * 2);
+        int canvasMazeAreaH = Mathf.Max(317, rawMazeH + MARGIN_Y * 2);
+        mazeOffsetX = (canvasW - rawMazeW) / 2;
+        mazeOffsetY = TOP_BAR_HEIGHT + (canvasMazeAreaH - rawMazeH) / 2;
+
+        InitFramebuffer(canvasW, TOP_BAR_HEIGHT + canvasMazeAreaH + BOT_BAR_HEIGHT);
+
+        int minR = fillUnoccupiedWithCheckerboard ? 0 : 1;
+        int maxR = fillUnoccupiedWithCheckerboard ? MazeData.MaxRow + 1 : MazeData.MaxRow;
+        int minC = fillUnoccupiedWithCheckerboard ? 0 : 1;
+        int maxC = fillUnoccupiedWithCheckerboard ? MazeData.MaxCol + 1 : MazeData.MaxCol;
+
+        int cellUnits = (maxR - minR + 1) * (maxC - minC + 1);
+        int wallUnits = (MazeData.MaxRow + 1) * 3;
+        int combineUnits = 64;
+        mazeBuildTotalUnits = cellUnits + wallUnits + combineUnits;
+        mazeBuildDoneUnits = 0;
+
+        if (asyncHiddenBuild && mazeBuildRevealCellsOnMap)
+        {
+            // Empty Mac desktop gray canvas: the maze is drawn in cell-by-cell as it is built
+            FillGrayRectFB(0, 0, fbWidth, fbHeight);
+            DrawBottomButtonsBar2D();
+            LayoutBuildProgressPanel();
+            mazeBuildStatusText = "Building floors...";
+            OnBuildYield();
+        }
+
+        for (int r = minR; r <= maxR; r++)
+        {
+            for (int c = minC; c <= maxC; c++)
+            {
+                bool insideGrid = (r >= 1 && r <= MazeData.MaxRow && c >= 1 && c <= MazeData.MaxCol);
+                BuildSingleMazeCell(r, c, insideGrid);
+                if (asyncHiddenBuild && insideGrid && mazeBuildRevealCellsOnMap) DrawSquare2D(r, c);
+                AdvanceBuildProgress(1);
+
+                if (BuildBudgetExceeded())
+                {
+                    OnBuildYield();
+                    yield return null;
+                    buildFrameStopwatch.Restart();
+                }
+            }
+        }
+
+        if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
+        {
+            mazeBuildStatusText = "Building walls...";
+            yield return BuildSeamlessFlatWallsWithPhysicalOutlinesRoutine();
+        }
+        else
+        {
+            AdvanceBuildProgress(wallUnits);
+        }
+
+        if (asyncHiddenBuild && mazeBuildRevealCellsOnMap)
+        {
+            // Maze outline frame around the finished map
+            FillRectFB(mazeOffsetX - 1, mazeOffsetY - 1, MazeData.MaxCol * TILE_STRIDE + 2, 1, 1);
+            FillRectFB(mazeOffsetX - 1, mazeOffsetY + MazeData.MaxRow * TILE_STRIDE, MazeData.MaxCol * TILE_STRIDE + 2, 1, 1);
+            FillRectFB(mazeOffsetX - 1, mazeOffsetY - 1, 1, MazeData.MaxRow * TILE_STRIDE + 2, 1);
+            FillRectFB(mazeOffsetX + MazeData.MaxCol * TILE_STRIDE, mazeOffsetY - 1, 1, MazeData.MaxRow * TILE_STRIDE + 2, 1);
+        }
+
+        float markerOffsetY = Mathf.Max(0.55f, wallHeight * 0.65f);
+        float startY = GetLayerBaseFloorY(MazeData.StartPos.layer) + markerOffsetY;
+        float endY   = GetLayerBaseFloorY(MazeData.EndPos.layer) + markerOffsetY;
+        startMarkerRenderer = SpawnMarkerPrimitive(PrimitiveType.Sphere, MazeData.StartPos.r, MazeData.StartPos.c, startY, "StartSphere_Marker");
+        endMarkerRenderer   = SpawnMarkerPrimitive(PrimitiveType.Cube, MazeData.EndPos.r, MazeData.EndPos.c, endY, "GoalCube_Marker");
+
+        mazeBuildStatusText = "Optimizing meshes...";
+        yield return CombineStaticMazeMeshesRoutine(combineUnits);
+        RegisterSingleCombinedTeleportationArea();
+    }
+
+    void BuildSingleMazeCell(int r, int c, bool insideGrid)
+    {
+        bool isRampCell = insideGrid && MazeData.IsRamp(r, c);
+        int wBaseOpen   = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BASE) & 0x0F) : 0;
+        int wBridgeOpen = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BRIDGE) & 0x0F) : 0;
+        int nBaseOpen   = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BASE) & 0x0F) : 0;
+        int nBridgeOpen = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BRIDGE) & 0x0F) : 0;
+
+        if (isRampCell)
+        {
+            BuildTaperedRampStairsCell(r, c, wBaseOpen, nBaseOpen);
+            return;
+        }
+
+        // 1. LOWER WIDE PLANE (y = 0m)
+        if (wBaseOpen == 0 && wBridgeOpen == 0)
+        {
+            if (fillUnoccupiedWithCheckerboard)
+                BuildUnoccupiedCheckerboardCell(r, c);
+        }
+        else if (wBridgeOpen != 0)
+        {
+            BuildSimultaneousNonEuclideanBridgeCell(r, c, wBaseOpen, wBridgeOpen, isNarrowPlane: false);
+        }
+        else
+        {
+            BuildWideCellFloorAndBreadcrumbs(mazeRoot.transform, r, c, AmazingMazeData.LAYER_WIDE_BASE, whiteFloorMaterial, blackBreadcrumbMaterial, true);
+            if (architectureStyle == WallArchitectureStyle.CycladicRounded)
+                BuildCycladicCellWalls(r, c, wBaseOpen);
+        }
+
+        // 2. UPPER NARROW PLANE (y = upperFloorY)
+        if (nBridgeOpen != 0)
+        {
+            BuildSimultaneousNonEuclideanBridgeCell(r, c, nBaseOpen, nBridgeOpen, isNarrowPlane: true);
+        }
+        else if (nBaseOpen != 0)
+        {
+            BuildUpperNarrowCorridorCell(r, c, nBaseOpen);
+        }
     }
 
     void RepositionPlayerAtStart()
@@ -2004,96 +2477,24 @@ public class AmazingMazeBuilder3D : MonoBehaviour
      * ============================================================================ */
     public void RebuildMazeGeometryOnly()
     {
-        // Ensure upper narrow walkway (including its 0.12m floor slab thickness) always sits cleanly above lower archway roofs and edge bars
-        upperFloorY = Mathf.Max(upperFloorY, tunnelArchHeight + 0.25f);
-        lastBuiltStyle = architectureStyle;
-        if (mazeRoot != null) Destroy(mazeRoot);
-        mazeRoot = new GameObject("MazeGeometryRoot");
-        breadcrumbMeshes.Clear();
-        rampBreadcrumbMeshes.Clear();
-        stairFloorColliders.Clear();
-        walkableTeleportColliders.Clear();
-        bridgeCells.Clear();
-        lastBridgeSortLayer = -1;
-
-        int rawMazeW = MazeData.MaxCol * TILE_STRIDE + 1;
-        int rawMazeH = MazeData.MaxRow * TILE_STRIDE + 1;
-        int canvasW = Mathf.Max(481, rawMazeW + MARGIN_X * 2);
-        int canvasMazeAreaH = Mathf.Max(317, rawMazeH + MARGIN_Y * 2);
-        mazeOffsetX = (canvasW - rawMazeW) / 2;
-        mazeOffsetY = TOP_BAR_HEIGHT + (canvasMazeAreaH - rawMazeH) / 2;
-
-        InitFramebuffer(canvasW, TOP_BAR_HEIGHT + canvasMazeAreaH + BOT_BAR_HEIGHT);
-
-        int minR = fillUnoccupiedWithCheckerboard ? 0 : 1;
-        int maxR = fillUnoccupiedWithCheckerboard ? MazeData.MaxRow + 1 : MazeData.MaxRow;
-        int minC = fillUnoccupiedWithCheckerboard ? 0 : 1;
-        int maxC = fillUnoccupiedWithCheckerboard ? MazeData.MaxCol + 1 : MazeData.MaxCol;
-
-        for (int r = minR; r <= maxR; r++)
-        {
-            for (int c = minC; c <= maxC; c++)
-            {
-                bool insideGrid = (r >= 1 && r <= MazeData.MaxRow && c >= 1 && c <= MazeData.MaxCol);
-                bool isRampCell = insideGrid && MazeData.IsRamp(r, c);
-                int wBaseOpen   = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BASE) & 0x0F) : 0;
-                int wBridgeOpen = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_WIDE_BRIDGE) & 0x0F) : 0;
-                int nBaseOpen   = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BASE) & 0x0F) : 0;
-                int nBridgeOpen = insideGrid ? (MazeData.GetSquare(r, c, AmazingMazeData.LAYER_NARROW_BRIDGE) & 0x0F) : 0;
-
-                if (isRampCell)
-                {
-                    BuildTaperedRampStairsCell(r, c, wBaseOpen, nBaseOpen);
-                    continue;
-                }
-
-                // 1. LOWER WIDE PLANE (y = 0m)
-                if (wBaseOpen == 0 && wBridgeOpen == 0)
-                {
-                    if (fillUnoccupiedWithCheckerboard)
-                        BuildUnoccupiedCheckerboardCell(r, c);
-                }
-                else if (wBridgeOpen != 0)
-                {
-                    BuildSimultaneousNonEuclideanBridgeCell(r, c, wBaseOpen, wBridgeOpen, isNarrowPlane: false);
-                }
-                else
-                {
-                    BuildWideCellFloorAndBreadcrumbs(mazeRoot.transform, r, c, AmazingMazeData.LAYER_WIDE_BASE, whiteFloorMaterial, blackBreadcrumbMaterial, true);
-                    if (architectureStyle == WallArchitectureStyle.CycladicRounded)
-                        BuildCycladicCellWalls(r, c, wBaseOpen);
-                }
-
-                // 2. UPPER NARROW PLANE (y = upperFloorY)
-                if (nBridgeOpen != 0)
-                {
-                    BuildSimultaneousNonEuclideanBridgeCell(r, c, nBaseOpen, nBridgeOpen, isNarrowPlane: true);
-                }
-                else if (nBaseOpen != 0)
-                {
-                    BuildUpperNarrowCorridorCell(r, c, nBaseOpen);
-                }
-            }
-        }
-
-        if (architectureStyle == WallArchitectureStyle.FlatEdgedMac1Bit)
-        {
-            BuildSeamlessFlatWallsWithPhysicalOutlines();
-        }
-
-        float markerOffsetY = Mathf.Max(0.55f, wallHeight * 0.65f);
-        float startY = GetLayerBaseFloorY(MazeData.StartPos.layer) + markerOffsetY;
-        float endY   = GetLayerBaseFloorY(MazeData.EndPos.layer) + markerOffsetY;
-        startMarkerRenderer = SpawnMarkerPrimitive(PrimitiveType.Sphere, MazeData.StartPos.r, MazeData.StartPos.c, startY, "StartSphere_Marker");
-        endMarkerRenderer   = SpawnMarkerPrimitive(PrimitiveType.Cube, MazeData.EndPos.r, MazeData.EndPos.c, endY, "GoalCube_Marker");
-
-        CombineStaticMazeMeshes();
-        RegisterSingleCombinedTeleportationArea();
+        // Synchronous build (startup / style toggle): budget is unlimited so the routine never yields mid-way
+        double savedBudget = buildFrameBudgetMs;
+        int savedBatch = buildDestroyBatchSize;
+        buildFrameBudgetMs = double.MaxValue;
+        buildDestroyBatchSize = int.MaxValue;
+        RunEnumeratorToCompletion(BuildMazeGeometryRoutine(asyncHiddenBuild: false));
+        buildFrameBudgetMs = savedBudget;
+        buildDestroyBatchSize = savedBatch;
     }
 
     void CombineStaticMazeMeshes()
     {
-        if (mazeRoot == null) return;
+        RunEnumeratorToCompletion(CombineStaticMazeMeshesRoutine(0));
+    }
+
+    IEnumerator CombineStaticMazeMeshesRoutine(int progressUnits)
+    {
+        if (mazeRoot == null) yield break;
 
         // Collect all dynamic breadcrumb GameObjects so they are excluded from static mesh combining
         HashSet<GameObject> excludedObjects = new HashSet<GameObject>();
@@ -2131,8 +2532,20 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         List<Mesh> instantiatedMeshesToDestroy = new List<Mesh>(12000);
 
         MeshRenderer[] allRenderers = mazeRoot.GetComponentsInChildren<MeshRenderer>(true);
+        int gatherProgressUnits = progressUnits / 4;
+        int gatherUnitsGiven = 0;
         for (int i = 0; i < allRenderers.Length; i++)
         {
+            if ((i & 255) == 0 && BuildBudgetExceeded())
+            {
+                int target = gatherProgressUnits * i / Mathf.Max(1, allRenderers.Length);
+                AdvanceBuildProgress(target - gatherUnitsGiven);
+                gatherUnitsGiven = target;
+                OnBuildYield();
+                yield return null;
+                buildFrameStopwatch.Restart();
+            }
+
             MeshRenderer mr = allRenderers[i];
             if (mr == null) continue;
             GameObject go = mr.gameObject;
@@ -2169,6 +2582,16 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                 Destroy(mf);
             }
         }
+        AdvanceBuildProgress(gatherProgressUnits - gatherUnitsGiven);
+
+        // Combine in bounded chunks so no single frame performs a giant CombineMeshes call
+        const int MaxInstancesPerChunk = 1536;
+        int totalChunks = 0;
+        foreach (var kvp in combineGroups)
+            totalChunks += (kvp.Value.Count + MaxInstancesPerChunk - 1) / MaxInstancesPerChunk;
+        int combineProgressUnits = progressUnits / 2;
+        int combineUnitsGiven = 0;
+        int chunksDone = 0;
 
         foreach (var kvp in combineGroups)
         {
@@ -2176,40 +2599,89 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             List<CombineInstance> instances = kvp.Value;
             if (instances.Count == 0) continue;
 
-            GameObject combinedObj = new GameObject($"CombinedMaze_{mat.name}");
-            combinedObj.transform.SetParent(mazeRoot.transform, false);
-            combinedObj.transform.position = Vector3.zero;
-            combinedObj.transform.rotation = Quaternion.identity;
-            combinedObj.transform.localScale = Vector3.one;
-
-            Mesh combinedMesh = new Mesh
+            for (int start = 0; start < instances.Count; start += MaxInstancesPerChunk)
             {
-                name = $"CombinedMesh_{mat.name}",
-                indexFormat = UnityEngine.Rendering.IndexFormat.UInt32
-            };
-            combinedMesh.CombineMeshes(instances.ToArray(), true, true, false);
-            combinedMesh.RecalculateBounds();
+                int count = Mathf.Min(MaxInstancesPerChunk, instances.Count - start);
+                CombineInstance[] chunk = instances.GetRange(start, count).ToArray();
 
-            MeshFilter cmf = combinedObj.AddComponent<MeshFilter>();
-            cmf.sharedMesh = combinedMesh;
+                GameObject combinedObj = new GameObject($"CombinedMaze_{mat.name}_{start / MaxInstancesPerChunk}");
+                combinedObj.transform.SetParent(mazeRoot.transform, false);
+                combinedObj.transform.position = Vector3.zero;
+                combinedObj.transform.rotation = Quaternion.identity;
+                combinedObj.transform.localScale = Vector3.one;
 
-            MeshRenderer cmr = combinedObj.AddComponent<MeshRenderer>();
-            cmr.sharedMaterial = mat;
-            cmr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-            cmr.receiveShadows = false;
+                Mesh combinedMesh = new Mesh
+                {
+                    name = $"CombinedMesh_{mat.name}",
+                    indexFormat = UnityEngine.Rendering.IndexFormat.UInt32
+                };
+                combinedMesh.CombineMeshes(chunk, true, true, false);
+                combinedMesh.RecalculateBounds();
+
+                MeshFilter cmf = combinedObj.AddComponent<MeshFilter>();
+                cmf.sharedMesh = combinedMesh;
+
+                MeshRenderer cmr = combinedObj.AddComponent<MeshRenderer>();
+                cmr.sharedMaterial = mat;
+                cmr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                cmr.receiveShadows = false;
+
+                chunksDone++;
+                int target = combineProgressUnits * chunksDone / Mathf.Max(1, totalChunks);
+                AdvanceBuildProgress(target - combineUnitsGiven);
+                combineUnitsGiven = target;
+
+                if (BuildBudgetExceeded())
+                {
+                    OnBuildYield();
+                    yield return null;
+                    buildFrameStopwatch.Restart();
+                }
+            }
         }
+        AdvanceBuildProgress(combineProgressUnits - combineUnitsGiven);
+
+        // Destroy the now-redundant individual pieces in batches (Destroy cost lands at end of frame)
+        int destroyProgressUnits = progressUnits - gatherProgressUnits - combineProgressUnits;
+        int totalToDestroy = visualOnlyToDestroy.Count + instantiatedMeshesToDestroy.Count;
+        int destroyedSoFar = 0;
+        int destroyUnitsGiven = 0;
+        int batchCounter = 0;
 
         for (int i = 0; i < visualOnlyToDestroy.Count; i++)
         {
             if (visualOnlyToDestroy[i] != null)
                 Destroy(visualOnlyToDestroy[i]);
+            destroyedSoFar++;
+            if (++batchCounter >= buildDestroyBatchSize)
+            {
+                batchCounter = 0;
+                int target = destroyProgressUnits * destroyedSoFar / Mathf.Max(1, totalToDestroy);
+                AdvanceBuildProgress(target - destroyUnitsGiven);
+                destroyUnitsGiven = target;
+                OnBuildYield();
+                yield return null;
+                buildFrameStopwatch.Restart();
+            }
         }
 
         for (int i = 0; i < instantiatedMeshesToDestroy.Count; i++)
         {
             if (instantiatedMeshesToDestroy[i] != null)
                 Destroy(instantiatedMeshesToDestroy[i]);
+            destroyedSoFar++;
+            if (++batchCounter >= buildDestroyBatchSize)
+            {
+                batchCounter = 0;
+                int target = destroyProgressUnits * destroyedSoFar / Mathf.Max(1, totalToDestroy);
+                AdvanceBuildProgress(target - destroyUnitsGiven);
+                destroyUnitsGiven = target;
+                OnBuildYield();
+                yield return null;
+                buildFrameStopwatch.Restart();
+            }
         }
+        AdvanceBuildProgress(destroyProgressUnits - destroyUnitsGiven);
     }
 
     void BuildSimultaneousNonEuclideanBridgeCell(int r, int c, int baseOpenMask, int bridgeOpenMask, bool isNarrowPlane)
@@ -2632,6 +3104,11 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     void BuildSeamlessFlatWallsWithPhysicalOutlines()
     {
+        RunEnumeratorToCompletion(BuildSeamlessFlatWallsWithPhysicalOutlinesRoutine());
+    }
+
+    IEnumerator BuildSeamlessFlatWallsWithPhysicalOutlinesRoutine()
+    {
         int R = MazeData.MaxRow;
         int C = MazeData.MaxCol;
 
@@ -2733,6 +3210,14 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
                 CreateWallColliderWorld(wallsRoot.transform, mid, new Vector3(cellSize, 4.5f, wt));
             }
+
+            AdvanceBuildProgress(1);
+            if (BuildBudgetExceeded())
+            {
+                OnBuildYield();
+                yield return null;
+                buildFrameStopwatch.Restart();
+            }
         }
 
         for (int r = 1; r <= R; r++)
@@ -2755,7 +3240,16 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
                 CreateWallColliderWorld(wallsRoot.transform, mid, new Vector3(wt, 4.5f, cellSize));
             }
+
+            AdvanceBuildProgress(1);
+            if (BuildBudgetExceeded())
+            {
+                OnBuildYield();
+                yield return null;
+                buildFrameStopwatch.Restart();
+            }
         }
+        AdvanceBuildProgress(1); // balance: vertical-wall loop has R rows vs R+1 budgeted units
 
         // Build all vertex posts (both normal 0.85m posts AND 2.01m Archway Pillars) using exact hWall/vWall topology!
         for (int vr = 0; vr <= R; vr++)
@@ -2866,6 +3360,14 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                     DrawPillarQuadrantVerticalEdge(1, -1, brSE, hasS, hasE); // SE quadrant
                     DrawPillarQuadrantVerticalEdge(-1, -1, brSW, hasS, hasW); // SW quadrant
                 }
+            }
+
+            AdvanceBuildProgress(1);
+            if (BuildBudgetExceeded())
+            {
+                OnBuildYield();
+                yield return null;
+                buildFrameStopwatch.Restart();
             }
         }
     }
@@ -4681,6 +5183,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     void ExecuteWristButtonAction(int btnIndex)
     {
+        if (isGeneratingMaze) return;
         if (btnIndex >= 0 && btnIndex <= 3)
         {
             // Radio button: select skill level (Easy..Hard) without immediately regenerating the maze
@@ -4836,10 +5339,12 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         fbHeight = h;
         fbPixels = new byte[w * h];
         fbColors = new Color32[w * h];
+        if (mac2DMapTex != null) Destroy(mac2DMapTex);
         mac2DMapTex = new Texture2D(w, h, TextureFormat.RGBA32, false);
         mac2DMapTex.filterMode = FilterMode.Point;
         mac2DMapTex.wrapMode = TextureWrapMode.Clamp;
         if (wristMapMaterial != null) wristMapMaterial.mainTexture = mac2DMapTex;
+        if (buildProgressPanelMaterial != null) buildProgressPanelMaterial.mainTexture = mac2DMapTex;
     }
 
     void SetPixelFB(int x, int y, byte val)
@@ -5655,7 +6160,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             }
         }
 
-        if (activePlayerHeadOrBody != null)
+        if (activePlayerHeadOrBody != null && !isGeneratingMaze)
         {
             Vector3 wp = activePlayerHeadOrBody.position;
             float exactMapX = mazeOffsetX + 7.5f + (wp.x / cellSize) * TILE_STRIDE;
@@ -5837,6 +6342,9 @@ public class SimpleDesktopMazeWalker : MonoBehaviour
             pitch = Mathf.Clamp(pitch - my, -80f, 80f);
             if (camTransform != null) camTransform.localEulerAngles = new Vector3(pitch, 0f, 0f);
         }
+
+        // Mouse-look stays live while a new maze is being built; walking is paused
+        if (builder.IsGeneratingMaze) return;
 
         float speed = builder.isRunMode ? builder.runSpeed : builder.walkSpeed;
         float h = Input.GetAxisRaw("Horizontal");
