@@ -29,7 +29,7 @@ public class AmazingMazeData
         new SkillConfig { rows = 19, cols = 31, allowWideBridges = false, allowNarrowPlane = false, allowNarrowBridges = false, numWalks = 55,  rampChance = 0f,    bridgeChance = 0f,    label = "Level 1 (Easy): Wide paths only" },
         new SkillConfig { rows = 19, cols = 31, allowWideBridges = true,  allowNarrowPlane = false, allowNarrowBridges = false, numWalks = 150, rampChance = 0f,    bridgeChance = 0.65f, label = "Level 2: Wide paths + 90 deg tunnels" },
         new SkillConfig { rows = 20, cols = 32, allowWideBridges = true,  allowNarrowPlane = true,  allowNarrowBridges = true,  numWalks = 340, rampChance = 0.16f, bridgeChance = 0.70f, label = "Level 3: Upper Narrow Walkways + Tunnels" },
-        new SkillConfig { rows = 20, cols = 32, allowWideBridges = true,  allowNarrowPlane = true,  allowNarrowBridges = true,  numWalks = 520, rampChance = 0.55f, bridgeChance = 0.85f, label = "Level 4 (Hard): Max Tunnels & Ramps" }
+        new SkillConfig { rows = 20, cols = 32, allowWideBridges = true,  allowNarrowPlane = true,  allowNarrowBridges = true,  numWalks = 520, rampChance = 0.24f, bridgeChance = 0.92f, label = "Level 4 (Hard): Max Tunnels & Ramps" }
     };
 
     public struct NodePos : IEquatable<NodePos>
@@ -141,7 +141,7 @@ public class AmazingMazeData
         public float priority;
     }
 
-    public void MakeMaze(int skillLevel = 0)
+    public void MakeMaze(int skillLevel = 0, int retryDepth = 0)
     {
         SkillLevel = Mathf.Clamp(skillLevel, 0, SKILL_CONFIGS.Length - 1);
         SkillConfig cfg = SKILL_CONFIGS[SkillLevel];
@@ -358,17 +358,93 @@ public class AmazingMazeData
             }
         }
 
+        Dictionary<(int r, int c, int layer), int> ComputeMoveDistancesFrom(NodePos origin)
+        {
+            var distMap = new Dictionary<(int r, int c, int layer), int>();
+            distMap[(origin.r, origin.c, origin.layer)] = 0;
+            var q = new Queue<(NodePos pos, int d)>();
+            q.Enqueue((origin, 0));
+            while (q.Count > 0)
+            {
+                var cur = q.Dequeue();
+                for (int dir = 0; dir < 4; dir++)
+                {
+                    var stepOpt = CanMove(cur.pos.r, cur.pos.c, cur.pos.layer, dir);
+                    if (!stepOpt.HasValue) continue;
+                    var step = stepOpt.Value;
+                    var key = (step.r, step.c, step.layer);
+                    if (!distMap.ContainsKey(key))
+                    {
+                        distMap[key] = cur.d + 1;
+                        q.Enqueue((new NodePos(step.r, step.c, step.layer), cur.d + 1));
+                    }
+                }
+            }
+            return distMap;
+        }
+
+        float minMult = (SkillLevel == 3) ? 1.05f : 0.85f;
+        int minSolutionMoves = Mathf.Max(12, Mathf.FloorToInt((MaxRow + MaxCol) * minMult));
+
         if (wideDeadEnds.Count >= 2)
         {
-            StartPos = wideDeadEnds[rng.Next(wideDeadEnds.Count)];
-            int bestDist = -1;
-            NodePos bestEnd = wideDeadEnds[0];
-            foreach (var cand in wideDeadEnds)
+            var longPairs = new List<(NodePos a, NodePos b, int moves, int score)>();
+            (NodePos a, NodePos b, int moves, int score) bestPair = default;
+            int bestMoves = -1;
+
+            for (int i = 0; i < wideDeadEnds.Count; i++)
             {
-                int d = Mathf.Abs(cand.r - StartPos.r) + Mathf.Abs(cand.c - StartPos.c);
-                if (d > bestDist) { bestDist = d; bestEnd = cand; }
+                NodePos a = wideDeadEnds[i];
+                var distMap = ComputeMoveDistancesFrom(a);
+                for (int j = i + 1; j < wideDeadEnds.Count; j++)
+                {
+                    NodePos b = wideDeadEnds[j];
+                    if (!distMap.TryGetValue((b.r, b.c, b.layer), out int moves)) continue;
+                    bool aBorder = (a.r <= 2 || a.r >= MaxRow - 1 || a.c <= 2 || a.c >= MaxCol - 1);
+                    bool bBorder = (b.r <= 2 || b.r >= MaxRow - 1 || b.c <= 2 || b.c >= MaxCol - 1);
+                    int score = moves + (aBorder ? 4 : 0) + (bBorder ? 4 : 0);
+                    if (moves > bestMoves || (moves == bestMoves && score > bestPair.score))
+                    {
+                        bestMoves = moves;
+                        bestPair = (a, b, moves, score);
+                    }
+                    if (moves >= minSolutionMoves)
+                    {
+                        longPairs.Add((a, b, moves, score));
+                    }
+                }
             }
-            EndPos = bestEnd;
+
+            if (longPairs.Count == 0 && retryDepth < 20)
+            {
+                MakeMaze(skillLevel, retryDepth + 1);
+                return;
+            }
+
+            var chosen = bestPair;
+            if (longPairs.Count > 0)
+            {
+                longPairs.Sort((p, q) => q.score.CompareTo(p.score));
+                int topCount = Mathf.Max(1, Mathf.CeilToInt(longPairs.Count * 0.35f));
+                chosen = longPairs[rng.Next(topCount)];
+            }
+
+            if (bestMoves >= 0 || longPairs.Count > 0)
+            {
+                bool flip = rng.NextDouble() < 0.5;
+                StartPos = flip ? chosen.b : chosen.a;
+                EndPos = flip ? chosen.a : chosen.b;
+            }
+            else
+            {
+                StartPos = wideDeadEnds[0];
+                EndPos = wideDeadEnds[1];
+            }
+        }
+        else if (retryDepth < 20)
+        {
+            MakeMaze(skillLevel, retryDepth + 1);
+            return;
         }
         else
         {
@@ -520,7 +596,20 @@ public class AmazingMazeData
 
     public List<NodePos> FindShortestPathToEnd()
     {
-        return FindShortestPath(PlayerPos, EndPos);
+        var fullSolution = FindShortestPath(StartPos, EndPos);
+        if (fullSolution.Count == 0 || PathHistory.Count == 0)
+            return fullSolution;
+
+        var indexMap = new Dictionary<NodePos, int>(fullSolution.Count);
+        for (int i = 0; i < fullSolution.Count; i++)
+            indexMap[fullSolution[i]] = i;
+
+        for (int k = PathHistory.Count - 1; k >= 0; k--)
+        {
+            if (indexMap.TryGetValue(PathHistory[k], out int solIdx))
+                return fullSolution.GetRange(solIdx, fullSolution.Count - solIdx);
+        }
+        return fullSolution;
     }
 
     public List<NodePos> FindShortestPath(NodePos fromNode, NodePos toNode)

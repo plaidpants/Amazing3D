@@ -161,7 +161,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
     // Right-hand Ray Interactor for pointing at the Left Wrist Map Tablet buttons
     private List<MonoBehaviour> rightInteractionRays = new List<MonoBehaviour>();
-    private int hoveredWristButtonIndex = -1; // -1 = none, 0..3 = Radio L1..L4, 4 = New Game, 5 = Solution
+    private int hoveredWristButtonIndex = -1; // -1 = none, 0..3 = Radio L1..L4, 4 = New Game, 5 = Solution, 6 = Trophy, 7 = Toggle Penguin, 8..10 = Stats Modal
 
     // Timer, Statistics, Solution Preview, Ambient Wind & Fireworks
     private const int TOP_BAR_HEIGHT = 36;
@@ -173,8 +173,14 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     private float currentMazeElapsedSeconds = 0f;
     private int lastDisplayedTimerInt = -1;
     private bool mazeSolvedState = false;
+    private bool showVictoryPenguin = true;
+    private bool solutionUsedThisMaze = false;
+    private bool showingStatsPage = false;
+    private bool confirmingStatsReset = false;
     private int[] levelSolveCounts = new int[4];
     private float[] levelBestTimes = new float[4];
+    private float[] levelTotalTimes = new float[4];
+    private int[] levelTimedSolves = new int[4];
 
     private bool isShowingSolution = false;
     private float solutionTimerRemaining = 0f;
@@ -272,17 +278,17 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         "    ##.......##                                                                        ",
         "   #..........##                                                                       ",
         "  #.............#                                                                      ",
-        " #..............##                                                                     ",
-        "##.....######....#.    #############################################                   ",
-        "#..........##....########################################################              ",
-        "#................###########################################################           ",
-        "#.................####.#.###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.########          ",
-        "#.................###.#.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.######         ",
-        "#.................##.#.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####       ",
-        "#...###...###.....###.####.##.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####       ",
-        "#...###.#.###.....########.###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####      ",
-        "#.....#.....#......######.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###.     ",
-        "##...............########.##.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###.    ",
+        " #.......####...##                                                                     ",
+        "##....#######....#.    #############################################                   ",
+        "#.....####..#....########################################################              ",
+        "#.....#.....#....###########################################################           ",
+        "#.....#.....#.....####.#.###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.########          ",
+        "#.....#...###.....###.#.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.######         ",
+        "#.....#..####.....##.#.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####       ",
+        "#...###..###......###.####.##.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####       ",
+        "#..####...........########.###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####      ",
+        "#..###.............######.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###      ",
+        "##...............########.##.#####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###     ",
         " #.............#############..#######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####    ",
         "  #............###.###..###....#######.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####    ",
         "  ##..........###.####..###.....#########.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####   ",
@@ -307,40 +313,40 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##############....###########.#.#.#.#.#.####  ",
         "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.############.....############.#.#.#.#.#.###  ",
         "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###########.....#############.#.#.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###########......############.#.#.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.......#############.#.#.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#######........##############.#.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####.........#############.#.#.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####..........#############.#.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...........############.#.#.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...........#############.#.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...........##############.#.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###............##############.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####.............############.#.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##..............#############.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............###########.#.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............#############.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............#############.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............#############.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............##############.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............#############.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............#############.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###..............############.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............###########.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............###########.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................##########.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................###########.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.................#########.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................##########.#.#.####  ",
-        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................#########.#.#.#.###  ",
-        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.................#########.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###########......############.#.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#########.......#############.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#######........##############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#####.........#############.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####..........#############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...........############.#.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...........#############.#.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...........##############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###............##############.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.####.............############.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##..............#############.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............###########.#.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............#############.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............#############.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............#############.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............##############.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............#############.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#...............#############.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###..............############.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............###########.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###...............###########.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##...............############.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................##########.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................###########.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.................#########.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................##########.#.####  ",
+        "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................#########.#.#.###  ",
+        "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.................#########.#.####  ",
         "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................########.#.#.#.###  ",
         "      ####.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.##................#########.#.#.####  ",
         "      ###.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.#.###................##########.#.#.###  ",
@@ -584,7 +590,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
 
         bool needRedraw2D = false;
 
-        if (!mazeSolvedState)
+        if (!mazeSolvedState && !showingStatsPage)
         {
             currentMazeElapsedSeconds += Time.deltaTime;
             int secInt = Mathf.FloorToInt(currentMazeElapsedSeconds);
@@ -690,6 +696,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     public void TriggerTemporarySolutionDisplay(float durationSeconds = 8.0f)
     {
         if (MazeData == null) return;
+        solutionUsedThisMaze = true;
         activeSolutionNodes = MazeData.FindShortestPathToEnd();
         isShowingSolution = activeSolutionNodes.Count > 1;
         solutionTimerRemaining = durationSeconds;
@@ -702,6 +709,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         currentMazeElapsedSeconds = 0f;
         lastDisplayedTimerInt = 0;
         mazeSolvedState = false;
+        showVictoryPenguin = true;
+        solutionUsedThisMaze = false;
+        showingStatsPage = false;
+        confirmingStatsReset = false;
         isShowingSolution = false;
         solutionTimerRemaining = 0f;
         activeSolutionNodes.Clear();
@@ -4425,6 +4436,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         {
             levelSolveCounts[i] = PlayerPrefs.GetInt($"Amazing_Solves_L{i}", 0);
             levelBestTimes[i]   = PlayerPrefs.GetFloat($"Amazing_BestTime_L{i}", 0f);
+            levelTotalTimes[i]  = PlayerPrefs.GetFloat($"Amazing_TotalTime_L{i}", 0f);
+            levelTimedSolves[i] = PlayerPrefs.GetInt($"Amazing_TimedSolves_L{i}", 0);
         }
     }
 
@@ -4433,6 +4446,34 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         if (lvl < 0 || lvl >= 4) return;
         PlayerPrefs.SetInt($"Amazing_Solves_L{lvl}", levelSolveCounts[lvl]);
         PlayerPrefs.SetFloat($"Amazing_BestTime_L{lvl}", levelBestTimes[lvl]);
+        PlayerPrefs.SetFloat($"Amazing_TotalTime_L{lvl}", levelTotalTimes[lvl]);
+        PlayerPrefs.SetInt($"Amazing_TimedSolves_L{lvl}", levelTimedSolves[lvl]);
+        PlayerPrefs.Save();
+    }
+
+    float GetLevelAverageTime(int lvl)
+    {
+        if (lvl < 0 || lvl >= 4) return 0f;
+        if (levelTimedSolves[lvl] > 0 && levelTotalTimes[lvl] > 0f)
+            return levelTotalTimes[lvl] / levelTimedSolves[lvl];
+        if (levelSolveCounts[lvl] == 1 && levelBestTimes[lvl] > 0f)
+            return levelBestTimes[lvl];
+        return 0f;
+    }
+
+    void ClearAllPersistentStats()
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            levelSolveCounts[i] = 0;
+            levelBestTimes[i] = 0f;
+            levelTotalTimes[i] = 0f;
+            levelTimedSolves[i] = 0;
+            PlayerPrefs.DeleteKey($"Amazing_Solves_L{i}");
+            PlayerPrefs.DeleteKey($"Amazing_BestTime_L{i}");
+            PlayerPrefs.DeleteKey($"Amazing_TotalTime_L{i}");
+            PlayerPrefs.DeleteKey($"Amazing_TimedSolves_L{i}");
+        }
         PlayerPrefs.Save();
     }
 
@@ -5027,13 +5068,22 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     void OnMazeSolvedVictory()
     {
         mazeSolvedState = true;
+        showVictoryPenguin = true;
         int lvl = Mathf.Clamp(skillLevel, 0, 3);
-        levelSolveCounts[lvl]++;
-        if (levelBestTimes[lvl] <= 0.01f || currentMazeElapsedSeconds < levelBestTimes[lvl])
+        if (!solutionUsedThisMaze)
         {
-            levelBestTimes[lvl] = currentMazeElapsedSeconds;
+            levelSolveCounts[lvl]++;
+            if (levelBestTimes[lvl] <= 0.01f || currentMazeElapsedSeconds < levelBestTimes[lvl])
+            {
+                levelBestTimes[lvl] = currentMazeElapsedSeconds;
+            }
+            if (currentMazeElapsedSeconds > 0f)
+            {
+                levelTotalTimes[lvl] += currentMazeElapsedSeconds;
+                levelTimedSolves[lvl]++;
+            }
+            SavePersistentStats(lvl);
         }
-        SavePersistentStats(lvl);
 
         EnsureProceduralAudioAndWind();
         if (fanfareAudioSource != null && victoryFanfareClip != null)
@@ -5136,6 +5186,14 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     /* ============================================================================
      * INTERACTIVE WRIST MAP TABLET BUTTONS (RIGHT CONTROLLER RAY + DESKTOP CLICK)
      * ============================================================================ */
+    void GetStatsModalRect(out int x0, out int y0, out int w, out int h)
+    {
+        w = Mathf.Min(360, fbWidth - 24);
+        h = Mathf.Min(232, fbHeight - 24);
+        x0 = (fbWidth - w) / 2;
+        y0 = (fbHeight - h) / 2;
+    }
+
     void GetWristButtonRect(int btnIndex, out int x0, out int y0, out int w, out int h)
     {
         int barTop = fbHeight - BOT_BAR_HEIGHT;
@@ -5159,7 +5217,7 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             x0 = fbWidth - 246;
             y0 = barTop + (BOT_BAR_HEIGHT - h) / 2;
         }
-        else
+        else if (btnIndex == 5)
         {
             // "Solution" / "Hide" Macintosh Rounded-Rect Button
             w = 114;
@@ -5167,10 +5225,66 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             x0 = fbWidth - 122;
             y0 = barTop + (BOT_BAR_HEIGHT - h) / 2;
         }
+        else if (btnIndex == 6)
+        {
+            // Top-right Trophy Icon Button in Stats Bar
+            w = 24;
+            h = 24;
+            x0 = fbWidth - 30;
+            y0 = (TOP_BAR_HEIGHT - h) / 2;
+        }
+        else if (btnIndex == 8 || btnIndex == 9)
+        {
+            GetStatsModalRect(out int mx, out int my, out int mw, out int mh);
+            h = 26;
+            int by = my + mh - h - 12;
+            if (confirmingStatsReset)
+            {
+                w = 78;
+                x0 = (btnIndex == 8) ? (mx + mw - 12 - w) : (mx + mw - 12 - w * 2 - 8);
+            }
+            else
+            {
+                w = (btnIndex == 8) ? 104 : 84;
+                x0 = (btnIndex == 8) ? (mx + 14) : (mx + mw - 14 - w);
+            }
+            y0 = by;
+        }
+        else
+        {
+            x0 = 0; y0 = 0; w = 0; h = 0;
+        }
     }
 
     int HitTestWristButton(int fbX, int fbY)
     {
+        if (showingStatsPage)
+        {
+            for (int i = 8; i <= 9; i++)
+            {
+                GetWristButtonRect(i, out int bx, out int by, out int bw, out int bh);
+                if (fbX >= bx && fbX < bx + bw && fbY >= by && fbY < by + bh)
+                    return i;
+            }
+            GetStatsModalRect(out int mx, out int my, out int mw, out int mh);
+            if (fbX < mx || fbX >= mx + mw || fbY < my || fbY >= my + mh)
+                return 10; // Click outside modal closes stats page
+            return -1;
+        }
+
+        // Top-right Trophy button
+        GetWristButtonRect(6, out int tx, out int ty, out int tw, out int th);
+        if (fbX >= tx && fbX < tx + tw && fbY >= ty && fbY < ty + th)
+            return 6;
+
+        // Post-win tap on maze area toggles victory penguin visibility
+        if (mazeSolvedState && fbY >= TOP_BAR_HEIGHT && fbY < fbHeight - BOT_BAR_HEIGHT)
+            return 7;
+
+        // Clicking/tapping the map while showing solution hides it immediately
+        if (isShowingSolution && fbY >= TOP_BAR_HEIGHT && fbY < fbHeight - BOT_BAR_HEIGHT)
+            return 11;
+
         if (fbY < fbHeight - BOT_BAR_HEIGHT) return -1;
         for (int i = 0; i < 6; i++)
         {
@@ -5184,6 +5298,30 @@ public class AmazingMazeBuilder3D : MonoBehaviour
     void ExecuteWristButtonAction(int btnIndex)
     {
         if (isGeneratingMaze) return;
+        if (showingStatsPage)
+        {
+            PlayClickBlipSound();
+            if (btnIndex == 8)
+            {
+                if (!confirmingStatsReset) confirmingStatsReset = true;
+                else { ClearAllPersistentStats(); confirmingStatsReset = false; }
+                RenderEntireMaze2D();
+            }
+            else if (btnIndex == 9)
+            {
+                if (confirmingStatsReset) confirmingStatsReset = false;
+                else showingStatsPage = false;
+                RenderEntireMaze2D();
+            }
+            else if (btnIndex == 10)
+            {
+                confirmingStatsReset = false;
+                showingStatsPage = false;
+                RenderEntireMaze2D();
+            }
+            return;
+        }
+
         if (btnIndex >= 0 && btnIndex <= 3)
         {
             // Radio button: select skill level (Easy..Hard) without immediately regenerating the maze
@@ -5198,6 +5336,25 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         {
             // "Solution" button: toggle temporary solution display
             ToggleSolutionDisplay();
+        }
+        else if (btnIndex == 6)
+        {
+            PlayClickBlipSound();
+            confirmingStatsReset = false;
+            showingStatsPage = true;
+            RenderEntireMaze2D();
+        }
+        else if (btnIndex == 7 && mazeSolvedState)
+        {
+            showVictoryPenguin = !showVictoryPenguin;
+            RenderEntireMaze2D();
+        }
+        else if (btnIndex == 11 && isShowingSolution)
+        {
+            isShowingSolution = false;
+            solutionTimerRemaining = 0f;
+            activeSolutionNodes.Clear();
+            RenderEntireMaze2D();
         }
     }
 
@@ -5548,21 +5705,25 @@ public class AmazingMazeBuilder3D : MonoBehaviour
             {
                 DrawWideCorridor(wBaseOpen);
                 DrawOccupiedSubLayer(AmazingMazeData.LAYER_WIDE_BASE);
+                DrawSolutionDotsForCellLayer(r, c, AmazingMazeData.LAYER_WIDE_BASE);
             }
             if (wBridgeOpen != 0)
             {
                 DrawWideOverpass(wBridgeOpen);
                 DrawOccupiedSubLayer(AmazingMazeData.LAYER_WIDE_BRIDGE);
+                DrawSolutionDotsForCellLayer(r, c, AmazingMazeData.LAYER_WIDE_BRIDGE);
             }
             if (nBaseOpen != 0)
             {
                 DrawNarrowCorridor(nBaseOpen);
                 DrawOccupiedSubLayer(AmazingMazeData.LAYER_NARROW_BASE);
+                DrawSolutionDotsForCellLayer(r, c, AmazingMazeData.LAYER_NARROW_BASE);
             }
             if (nBridgeOpen != 0)
             {
                 DrawNarrowOverpass(nBridgeOpen);
                 DrawOccupiedSubLayer(AmazingMazeData.LAYER_NARROW_BRIDGE);
+                DrawSolutionDotsForCellLayer(r, c, AmazingMazeData.LAYER_NARROW_BRIDGE);
             }
         }
         else
@@ -5670,6 +5831,8 @@ public class AmazingMazeBuilder3D : MonoBehaviour
                     }
                 }
             }
+            DrawSolutionDotsForCellLayer(r, c, AmazingMazeData.LAYER_WIDE_BASE);
+            DrawSolutionDotsForCellLayer(r, c, AmazingMazeData.LAYER_NARROW_BASE);
         }
 
         if (r == MazeData.EndPos.r && c == MazeData.EndPos.c)
@@ -5977,6 +6140,24 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         return string.Format("{0:00}:{1:00}", mins, secs);
     }
 
+    private static readonly string[] TROPHY_ICON_14X14 = new string[]
+    {
+        "              ",
+        "  ##########  ",
+        "##############",
+        "# ########## #",
+        "#  ########  #",
+        "## ######## ##",
+        "   ########   ",
+        "    ######    ",
+        "      ##      ",
+        "      ##      ",
+        "      ##      ",
+        "    ######    ",
+        "  ##########  ",
+        "              "
+    };
+
     void DrawTopStatsBar2D()
     {
         // Classic 1984 Mac Window Header / Status Bar (36px tall) with crisp 2px border
@@ -5990,12 +6171,13 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         int solves = levelSolveCounts[statsLvl];
         float best = levelBestTimes[statsLvl];
 
+        string solvedPrefix = solutionUsedThisMaze ? "Solved (w/ Sol)" : "Solved!";
         string statusText = mazeSolvedState
-            ? string.Format("Solved!  Time: {0}   Solves: {1}   Best: {2}", FormatTimeMMSS(currentMazeElapsedSeconds), solves, FormatTimeMMSS(best))
+            ? string.Format("{0}  Time: {1}   Solves: {2}   Best: {3}", solvedPrefix, FormatTimeMMSS(currentMazeElapsedSeconds), solves, FormatTimeMMSS(best))
             : string.Format("Time: {0}    Lv.{1} Solves: {2}    Best: {3}", FormatTimeMMSS(currentMazeElapsedSeconds), statsLvl + 1, solves, FormatTimeMMSS(best));
 
         int textW = MeasureChicagoText(statusText);
-        int startX = Mathf.Max(8, (fbWidth - textW) / 2);
+        int startX = Mathf.Max(8, (fbWidth - 32 - textW) / 2);
         int startY = (TOP_BAR_HEIGHT - 14) / 2;
 
         if (mazeSolvedState)
@@ -6006,6 +6188,24 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         else
         {
             DrawChicagoTextFB(startX, startY, statusText, 1);
+        }
+
+        // Top-right 1-bit Trophy Icon Button
+        GetWristButtonRect(6, out int tx, out int ty, out int tw, out int th);
+        bool trophyInvert = (hoveredWristButtonIndex == 6) || showingStatsPage;
+        byte fg = (byte)(mazeSolvedState ? (trophyInvert ? 1 : 0) : (trophyInvert ? 0 : 1));
+        byte bg = (byte)(fg == 1 ? 0 : 1);
+        FillRectFB(tx, ty, tw, th, fg);
+        FillRectFB(tx + 2, ty + 2, tw - 4, th - 4, bg);
+        int ix = tx + (tw - 14) / 2;
+        int iy = ty + (th - 14) / 2;
+        for (int r = 0; r < 14; r++)
+        {
+            string row = TROPHY_ICON_14X14[r];
+            for (int c = 0; c < 14; c++)
+            {
+                if (row[c] == '#') SetPixelFB(ix + c, iy + r, fg);
+            }
         }
     }
 
@@ -6046,43 +6246,96 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         DrawMacRoundRectButtonFB(solX, solY, solW, solH, solLabel, solInvert);
     }
 
-    void DrawSolutionPathOverlay2D()
+    private Dictionary<(int r, int c, int layer), List<(int x, int y, int w, int h)>> solutionDotsByCellLayer =
+        new Dictionary<(int r, int c, int layer), List<(int x, int y, int w, int h)>>();
+
+    void BuildSolutionDotsMap()
     {
+        solutionDotsByCellLayer.Clear();
         if (!isShowingSolution || activeSolutionNodes == null || activeSolutionNodes.Count < 2)
             return;
 
-        // Draw crisp 1-bit dotted/dashed centerline along the shortest path from Player to Goal
         for (int i = 0; i < activeSolutionNodes.Count - 1; i++)
         {
             var a = activeSolutionNodes[i];
             var b = activeSolutionNodes[i + 1];
 
+            int dir = -1;
+            if (b.c == a.c - 1) dir = AmazingMazeData.DIR_LEFT;
+            else if (b.r == a.r + 1) dir = AmazingMazeData.DIR_DOWN;
+            else if (b.c == a.c + 1) dir = AmazingMazeData.DIR_RIGHT;
+            else if (b.r == a.r - 1) dir = AmazingMazeData.DIR_UP;
+
+            int outLayer = a.layer;
+            int inLayer = b.layer;
+            if (dir != -1)
+            {
+                var stepInfo = MazeData.CanMove(a.r, a.c, a.layer, dir);
+                if (stepInfo.HasValue)
+                {
+                    int otherBase = (AmazingMazeData.BaseLayerOfPlane(a.layer) == AmazingMazeData.LAYER_WIDE_BASE)
+                        ? AmazingMazeData.LAYER_NARROW_BASE
+                        : AmazingMazeData.LAYER_WIDE_BASE;
+                    outLayer = MazeData.MemberOf(dir, a.r, a.c, a.layer) ? a.layer : otherBase;
+                    inLayer = stepInfo.Value.entryLayer;
+                }
+            }
+
             int ax = mazeOffsetX + (a.c - 1) * TILE_STRIDE + 7;
             int ay = mazeOffsetY + (a.r - 1) * TILE_STRIDE + 7;
             int bx = mazeOffsetX + (b.c - 1) * TILE_STRIDE + 7;
             int by = mazeOffsetY + (b.r - 1) * TILE_STRIDE + 7;
-
-            bool aOcc = (MazeData.GetSquare(a.r, a.c, a.layer) & 0x30) != 0;
-            bool bOcc = (MazeData.GetSquare(b.r, b.c, b.layer) & 0x30) != 0;
+            bool isHorizontal = (by == ay);
+            bool isCornerStart = (i > 0) && ((activeSolutionNodes[i - 1].r == a.r) != (a.r == b.r));
 
             int steps = Mathf.Max(Mathf.Abs(bx - ax), Mathf.Abs(by - ay));
             for (int s = 0; s <= steps; s++)
             {
-                if ((s & 2) != 0) continue;
+                bool firstHalf = s < steps / 2;
+                int segLayer = firstHalf ? outLayer : inLayer;
+                bool isWide = (segLayer == AmazingMazeData.LAYER_WIDE_BASE || segLayer == AmazingMazeData.LAYER_WIDE_BRIDGE);
+
+                if (isWide)
+                {
+                    if ((s & 2) != 0) continue;
+                }
+                else
+                {
+                    if ((s & 1) != 0) continue;
+                }
 
                 int px = (steps == 0) ? ax : (ax + (bx - ax) * s / steps);
                 int py = (steps == 0) ? ay : (ay + (by - ay) * s / steps);
-                bool occ = (s < steps / 2) ? aOcc : bOcc;
-                byte col = (byte)(occ ? 0 : 1);
+                int dw = (isWide || (s == 0 && isCornerStart) || !isHorizontal) ? 2 : 1;
+                int dh = (isWide || (s == 0 && isCornerStart) || isHorizontal) ? 2 : 1;
 
-                FillRectFB(px, py, 2, 2, col);
+                var key = firstHalf ? (a.r, a.c, outLayer) : (b.r, b.c, inLayer);
+                if (!solutionDotsByCellLayer.TryGetValue(key, out var list))
+                {
+                    list = new List<(int x, int y, int w, int h)>();
+                    solutionDotsByCellLayer[key] = list;
+                }
+                list.Add((px, py, dw, dh));
+            }
+        }
+    }
+
+    void DrawSolutionDotsForCellLayer(int r, int c, int layer)
+    {
+        if (!isShowingSolution || solutionDotsByCellLayer.Count == 0) return;
+        if (solutionDotsByCellLayer.TryGetValue((r, c, layer), out var list))
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                var d = list[i];
+                FillRectFB(d.x, d.y, d.w, d.h, 1);
             }
         }
     }
 
     void DrawVictoryPenguinOverlay2D()
     {
-        if (!mazeSolvedState) return;
+        if (!mazeSolvedState || !showVictoryPenguin) return;
 
         int spriteH = PENGUIN_SPRITE_87X112.Length;
         int spriteW = PENGUIN_SPRITE_87X112[0].Length;
@@ -6107,8 +6360,116 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         }
     }
 
+    void DrawStatsModalOverlay2D()
+    {
+        if (!showingStatsPage) return;
+
+        GetStatsModalRect(out int mx, out int my, out int mw, out int mh);
+
+        // Drop shadow + white interior + 2px black border
+        FillRectFB(mx + 4, my + 4, mw, mh, 1);
+        FillRectFB(mx, my, mw, mh, 0);
+        FillRectFB(mx, my, mw, 2, 1);
+        FillRectFB(mx, my + mh - 2, mw, 2, 1);
+        FillRectFB(mx, my, 2, mh, 1);
+        FillRectFB(mx + mw - 2, my, 2, mh, 1);
+
+        // Classic 1984 Mac pinstripe title bar
+        int titleH = 24;
+        for (int y = my + 3; y < my + titleH - 2; y += 2)
+            FillRectFB(mx + 4, y, mw - 8, 1, 1);
+        FillRectFB(mx, my + titleH, mw, 2, 1);
+
+        string title = "Statistics";
+        int titleW = MeasureChicagoText(title);
+        int titleX = mx + (mw - titleW) / 2;
+        FillRectFB(titleX - 8, my + 3, titleW + 16, titleH - 4, 0);
+        DrawChicagoTextFB(titleX, my + (titleH - 14) / 2, title, 1);
+
+        // Table columns
+        int colLevelX = mx + 16;
+        int colSolvesRight = mx + 178;
+        int colBestRight = mx + 262;
+        int colAvgRight = mx + mw - 16;
+
+        int headerY = my + titleH + 10;
+        DrawChicagoTextFB(colLevelX, headerY, "Level", 1);
+        DrawChicagoTextFB(colSolvesRight - MeasureChicagoText("Solves"), headerY, "Solves", 1);
+        DrawChicagoTextFB(colBestRight - MeasureChicagoText("Best"), headerY, "Best", 1);
+        DrawChicagoTextFB(colAvgRight - MeasureChicagoText("Avg"), headerY, "Avg", 1);
+        FillRectFB(mx + 12, headerY + 17, mw - 24, 2, 1);
+
+        string[] lvlNames = { "Lv.1 Easy", "Lv.2", "Lv.3", "Lv.4 Hard" };
+        int activeLvl = Mathf.Clamp(pendingSkillLevel, 0, 3);
+        int totalSolves = 0;
+        float totalTime = 0f;
+        int totalTimed = 0;
+        float overallBest = 0f;
+
+        for (int i = 0; i < 4; i++)
+        {
+            int ry = headerY + 24 + i * 24;
+            int solves = levelSolveCounts[i];
+            float best = levelBestTimes[i];
+            float avg = GetLevelAverageTime(i);
+
+            totalSolves += solves;
+            if (levelTimedSolves[i] > 0 && levelTotalTimes[i] > 0f)
+            {
+                totalTimed += levelTimedSolves[i];
+                totalTime += levelTotalTimes[i];
+            }
+            else if (solves == 1 && best > 0f)
+            {
+                totalTimed += 1;
+                totalTime += best;
+            }
+            if (best > 0f && (overallBest <= 0f || best < overallBest))
+                overallBest = best;
+
+            string lbl = (i == activeLvl) ? (">" + lvlNames[i]) : (" " + lvlNames[i]);
+            DrawChicagoTextFB(colLevelX - 4, ry, lbl, 1);
+
+            string sStr = solves.ToString();
+            string bStr = FormatTimeMMSS(best);
+            string aStr = FormatTimeMMSS(avg);
+            DrawChicagoTextFB(colSolvesRight - MeasureChicagoText(sStr), ry, sStr, 1);
+            DrawChicagoTextFB(colBestRight - MeasureChicagoText(bStr), ry, bStr, 1);
+            DrawChicagoTextFB(colAvgRight - MeasureChicagoText(aStr), ry, aStr, 1);
+
+            if (i < 3) FillRectFB(mx + 14, ry + 18, mw - 28, 1, 1);
+        }
+
+        int totalY = headerY + 24 + 4 * 24 + 4;
+        FillRectFB(mx + 12, totalY - 6, mw - 24, 2, 1);
+        float overallAvg = (totalTimed > 0) ? (totalTime / totalTimed) : 0f;
+        DrawChicagoTextFB(colLevelX, totalY, "Total", 1);
+        string tsStr = totalSolves.ToString();
+        string tbStr = FormatTimeMMSS(overallBest);
+        string taStr = FormatTimeMMSS(overallAvg);
+        DrawChicagoTextFB(colSolvesRight - MeasureChicagoText(tsStr), totalY, tsStr, 1);
+        DrawChicagoTextFB(colBestRight - MeasureChicagoText(tbStr), totalY, tbStr, 1);
+        DrawChicagoTextFB(colAvgRight - MeasureChicagoText(taStr), totalY, taStr, 1);
+
+        // Footer Buttons
+        GetWristButtonRect(8, out int b8x, out int b8y, out int b8w, out int b8h);
+        GetWristButtonRect(9, out int b9x, out int b9y, out int b9w, out int b9h);
+        if (confirmingStatsReset)
+        {
+            DrawChicagoTextFB(mx + 14, b8y + (b8h - 14) / 2, "Clear all stats?", 1);
+            DrawMacRoundRectButtonFB(b9x, b9y, b9w, b9h, "Cancel", hoveredWristButtonIndex == 9);
+            DrawMacRoundRectButtonFB(b8x, b8y, b8w, b8h, "Reset", true);
+        }
+        else
+        {
+            DrawMacRoundRectButtonFB(b8x, b8y, b8w, b8h, "Reset Stats", hoveredWristButtonIndex == 8);
+            DrawMacRoundRectButtonFB(b9x, b9y, b9w, b9h, "Close", hoveredWristButtonIndex == 9);
+        }
+    }
+
     void RenderEntireMaze2D()
     {
+        BuildSolutionDotsMap();
         FillGrayRectFB(0, 0, fbWidth, fbHeight);
 
         for (int r = 1; r <= MazeData.MaxRow; r++)
@@ -6120,10 +6481,10 @@ public class AmazingMazeBuilder3D : MonoBehaviour
         FillRectFB(mazeOffsetX - 1, mazeOffsetY - 1, 1, MazeData.MaxRow * TILE_STRIDE + 2, 1);
         FillRectFB(mazeOffsetX + MazeData.MaxCol * TILE_STRIDE, mazeOffsetY - 1, 1, MazeData.MaxRow * TILE_STRIDE + 2, 1);
 
-        DrawSolutionPathOverlay2D();
         DrawVictoryPenguinOverlay2D();
         DrawTopStatsBar2D();
         DrawBottomButtonsBar2D();
+        DrawStatsModalOverlay2D();
 
         FlushFramebufferWithPlayerWedge();
     }
